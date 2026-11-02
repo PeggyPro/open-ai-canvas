@@ -13,7 +13,10 @@ set GOMODCACHE=C:\Users\fuhan\Documents\github\open-ai-canvas\.local\cache\go-mo
 go env GOCACHE
 go env GOMODCACHE
 
-go run .\cmd\server
+# go run .\cmd\server
+& '..\.local\start-backend.cmd'
+
+
 
 # 终端二：前端
 cd ../web
