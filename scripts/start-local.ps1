@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
@@ -10,8 +10,17 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $backendDir = Join-Path $repoRoot "backend"
 $webDir = Join-Path $repoRoot "web"
 $dataDir = Join-Path $repoRoot ".local\project-workbench-debug"
+$adapterDir = Join-Path $backendDir "scripts"
+$adapterScript = Join-Path $adapterDir "h3_comfyui_adapter.py"
+$adapterDataDir = Join-Path $repoRoot ".local\h3-comfyui-adapter"
 $goBuildCache = Join-Path $repoRoot ".local\cache\go-build"
 $goModuleCache = Join-Path $repoRoot ".local\cache\go-mod"
+
+$pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+if (-not $pythonCommand) { $pythonCommand = Get-Command py.exe -ErrorAction SilentlyContinue }
+if (-not $pythonCommand) { throw "未找到 Python 3，无法启动 H3 ComfyUI 适配器。" }
+$pythonPath = $pythonCommand.Source
+$pythonUsesLauncher = [IO.Path]::GetFileName($pythonPath).ToLowerInvariant() -eq "py.exe"
 
 foreach ($commandName in @("go", "bun")) {
     if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
@@ -19,7 +28,7 @@ foreach ($commandName in @("go", "bun")) {
     }
 }
 
-foreach ($directory in @($dataDir, $goBuildCache, $goModuleCache)) {
+foreach ($directory in @($dataDir, $goBuildCache, $goModuleCache, $adapterDataDir)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
@@ -45,7 +54,7 @@ function Test-ListeningPort([int]$Port) {
     }
 }
 
-foreach ($port in @(3000, 8080)) {
+foreach ($port in @(3000, 8080, 5683)) {
     if (Test-ListeningPort $port) {
         throw "端口 $port 已被占用，请先关闭占用进程后重试。"
     }
@@ -66,6 +75,9 @@ function ConvertTo-PowerShellLiteral([string]$Value) {
 $backendDirLiteral = ConvertTo-PowerShellLiteral $backendDir
 $webDirLiteral = ConvertTo-PowerShellLiteral $webDir
 $dataDirLiteral = ConvertTo-PowerShellLiteral $dataDir
+$adapterScriptLiteral = ConvertTo-PowerShellLiteral $adapterScript
+$adapterDataDirLiteral = ConvertTo-PowerShellLiteral $adapterDataDir
+$pythonPathLiteral = ConvertTo-PowerShellLiteral $pythonPath
 
 $backendCommand = @"
 `$ErrorActionPreference = 'Stop'
@@ -86,9 +98,25 @@ Write-Host '影策前端：http://localhost:3000' -ForegroundColor Cyan
 bun run dev
 "@
 
+$adapterCommand = @"
+`$ErrorActionPreference = 'Stop'
+Set-Location -LiteralPath $adapterDirLiteral
+`$env:H3_ADAPTER_DATA_DIR = $adapterDataDirLiteral
+`$env:H3_COMFY_NATIVE_URL = 'http://127.0.0.1:8188'
+Write-Host 'H3 ComfyUI 适配器：http://127.0.0.1:5683' -ForegroundColor Cyan
+if ($pythonUsesLauncher) {
+    & $pythonPathLiteral -3 $adapterScriptLiteral
+} else {
+    & $pythonPathLiteral $adapterScriptLiteral
+}
+"@
+
 $backendProcess = Start-Process -FilePath $powerShellPath -WindowStyle Normal -WorkingDirectory $backendDir -PassThru -ArgumentList @("-NoLogo", "-NoExit", "-NoProfile", "-Command", $backendCommand)
+$adapterProcess = Start-Process -FilePath $powerShellPath -WindowStyle Normal -WorkingDirectory $adapterDir -PassThru -ArgumentList @("-NoLogo", "-NoExit", "-NoProfile", "-Command", $adapterCommand)
 $webProcess = Start-Process -FilePath $powerShellPath -WindowStyle Normal -WorkingDirectory $webDir -PassThru -ArgumentList @("-NoLogo", "-NoExit", "-NoProfile", "-Command", $webCommand)
 
 Write-Host "已打开前后端开发窗口。" -ForegroundColor Green
-Write-Host "后端窗口 PID: $($backendProcess.Id)；前端窗口 PID: $($webProcess.Id)"
-Write-Host "访问 http://localhost:3000；分别在两个窗口按 Ctrl+C 停止服务。"
+Write-Host "后端窗口 PID: $($backendProcess.Id)；适配器窗口 PID: $($adapterProcess.Id)；前端窗口 PID: $($webProcess.Id)"
+Write-Host "访问 http://localhost:3000；适配器 http://127.0.0.1:5683；分别在服务窗口按 Ctrl+C 停止。"
+
+

@@ -6,8 +6,11 @@ param()
 
 $ErrorActionPreference = "Stop"
 
-$repoRoot = "D:\yingce\open-ai-canvas-main"
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $backendDir = Join-Path $repoRoot "backend"
+$adapterDir = Join-Path $backendDir "scripts"
+$adapterScript = Join-Path $adapterDir "h3_comfyui_adapter.py"
+$adapterDataDir = Join-Path $repoRoot ".local\h3-comfyui-adapter"
 $webDir = Join-Path $repoRoot "web"
 $dataDir = Join-Path $repoRoot ".local\project-workbench-debug"
 $goBuildCache = Join-Path $repoRoot ".local\cache\go-build"
@@ -17,6 +20,12 @@ $bunExe = "C:\Users\Administrator\AppData\Roaming\npm\node_modules\bun\bin\bun.e
 if (-not (Test-Path -LiteralPath $bunExe)) { $bunExe = "bun" }
 $localUrl = "http://localhost:3000"
 $healthUrl = "http://127.0.0.1:3000/api/health"
+$adapterHealthUrl = "http://127.0.0.1:5683/health"
+$pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+if (-not $pythonCommand) { $pythonCommand = Get-Command py.exe -ErrorAction SilentlyContinue }
+if (-not $pythonCommand) { throw "未找到 Python 3，无法启动 H3 ComfyUI 适配器。" }
+$pythonPath = $pythonCommand.Source
+$pythonUsesLauncher = [IO.Path]::GetFileName($pythonPath).ToLowerInvariant() -eq "py.exe"
 
 function Test-PortListen([int]$Port) {
     try {
@@ -36,7 +45,7 @@ function Test-Http([string]$Url) {
 }
 
 # 0) 已全部就绪则直接打开
-if ((Test-PortListen 8080) -and (Test-PortListen 3000)) {
+if ((Test-PortListen 8080) -and (Test-PortListen 3000) -and (Test-PortListen 5683)) {
     Write-Host "影策画布已在运行，正在打开..." -ForegroundColor Green
     Start-Process $localUrl
     exit 0
@@ -59,7 +68,21 @@ if (-not (Test-PortListen 8080)) {
         -WindowStyle Hidden | Out-Null
 }
 
-# 2) 前端：3000
+# 2) 本地 H3 ComfyUI 适配器：5683
+if (-not (Test-PortListen 5683)) {
+    Write-Host "启动 H3 ComfyUI 适配器 (5683)..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force -Path $adapterDataDir | Out-Null
+    $env:H3_ADAPTER_DATA_DIR = $adapterDataDir
+    $env:H3_COMFY_NATIVE_URL = "http://127.0.0.1:8188"
+    $adapterArguments = if ($pythonUsesLauncher) { @("-3", $adapterScript) } else { @($adapterScript) }
+    Start-Process -FilePath $pythonPath -ArgumentList $adapterArguments `
+        -WorkingDirectory $adapterDir `
+        -RedirectStandardOutput (Join-Path $repoRoot ".local\h3-adapter.stdout.log") `
+        -RedirectStandardError (Join-Path $repoRoot ".local\h3-adapter.stderr.log") `
+        -WindowStyle Hidden | Out-Null
+}
+
+# 3) 前端：3000
 if (-not (Test-PortListen 3000)) {
     Write-Host "启动前端 (3000)..." -ForegroundColor Cyan
     $viteBinary = Join-Path $webDir "node_modules\.bin\vite"
@@ -76,7 +99,7 @@ if (-not (Test-PortListen 3000)) {
         -WindowStyle Hidden | Out-Null
 }
 
-# 3) cloudflared 隧道（公网 canvas.yingce.cc.cd）
+# 4) cloudflared 隧道（公网 canvas.yingce.cc.cd）
 if (-not (Get-Process -Name cloudflared -ErrorAction SilentlyContinue)) {
     if (Test-Path -LiteralPath $cloudflaredExe) {
         Write-Host "启动公网隧道 cloudflared..." -ForegroundColor Cyan
@@ -88,11 +111,11 @@ if (-not (Get-Process -Name cloudflared -ErrorAction SilentlyContinue)) {
     Write-Host "公网隧道 cloudflared 已在运行" -ForegroundColor DarkGray
 }
 
-# 4) 等待健康检查并打开浏览器
+# 5) 等待健康检查并打开浏览器
 $deadline = (Get-Date).AddMinutes(3)
 do {
     Start-Sleep -Seconds 2
-    if (Test-Http $healthUrl) {
+    if ((Test-Http $healthUrl) -and (Test-Http $adapterHealthUrl)) {
         Write-Host "影策画布已启动，正在打开浏览器..." -ForegroundColor Green
         Start-Sleep -Seconds 1
         Start-Process $localUrl
@@ -103,3 +126,4 @@ do {
 } while ((Get-Date) -lt $deadline)
 
 Write-Host "启动超时，请查看日志：.local\backend.stderr.log / .local\web.stderr.log" -ForegroundColor Red
+
