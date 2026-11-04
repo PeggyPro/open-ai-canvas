@@ -19,7 +19,7 @@ export function MediaPreview({
     onUnavailable,
 }: {
     src: string;
-    kind: "image" | "video";
+    kind: "image" | "video" | "audio";
     alt?: string;
     className?: string;
     fallbackClassName?: string;
@@ -45,6 +45,10 @@ export function MediaPreview({
                 <span>{fallbackLabel}</span>
             </span>
         );
+    }
+
+    if (kind === "audio") {
+        return <audio aria-label={alt || "音频试听"} src={src} controls preload="none" className={className} onError={handleUnavailable} />;
     }
 
     if (kind === "video") {

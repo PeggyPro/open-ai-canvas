@@ -8,6 +8,7 @@ type AgentAvatarBundleImport = app.AgentAvatarBundleImport
 const (
 	WorkbenchKindImage = app.WorkbenchKindImage
 	WorkbenchKindVideo = app.WorkbenchKindVideo
+	WorkbenchKindAudio = app.WorkbenchKindAudio
 )
 
 type (

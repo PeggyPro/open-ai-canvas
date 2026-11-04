@@ -44,7 +44,7 @@ export type GenerationTask = {
     officialStatus?: "pending" | "processing" | "completed" | "failed" | "cancelled";
     receiptRecorded?: boolean;
     previewUrl?: string;
-    previewKind?: "image" | "video";
+    previewKind?: "image" | "video" | "audio";
     previewPosterUrl?: string;
     inputJson?: string;
     resultJson?: string;

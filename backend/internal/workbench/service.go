@@ -16,6 +16,7 @@ import (
 const (
 	KindImage = model.WorkbenchKindImage
 	KindVideo = model.WorkbenchKindVideo
+	KindAudio = model.WorkbenchKindAudio
 )
 
 type AdminGate interface {

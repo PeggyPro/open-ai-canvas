@@ -13,7 +13,7 @@ func (r *Repository) WorkbenchTasks(userID, kind string, activeOnly bool, cursor
 	if limit < 1 || limit > 100 {
 		limit = 30
 	}
-	if kind != model.WorkbenchKindImage && kind != model.WorkbenchKindVideo {
+	if kind != model.WorkbenchKindImage && kind != model.WorkbenchKindVideo && kind != model.WorkbenchKindAudio {
 		return TaskPage{}, nil
 	}
 	query := r.db.Model(&model.Task{}).Where("user_id = ? AND workbench_kind = ?", userID, kind)

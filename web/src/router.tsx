@@ -52,6 +52,7 @@ const SharedCanvasPage = lazy(() => import("@/pages/canvas/shared"));
 const CreatePage = lazy(loadCreatePage);
 const ImageWorkbenchPage = lazy(() => import("@/pages/workbench/image-workbench-route"));
 const VideoWorkbenchPage = lazy(() => import("@/pages/workbench/video-workbench-page"));
+const AudioWorkbenchPage = lazy(() => import("@/pages/workbench/audio-workbench-page"));
 const NotFound = lazy(() => import("@/pages/not-found"));
 const SkillsPage = lazy(() => import("@/pages/skills"));
 const SkillWorkbenchPage = lazy(loadSkillWorkbenchPage);
@@ -131,6 +132,14 @@ export const router = createBrowserRouter([
                 element: (
                     <RequireAuth>
                         <RequireFeature feature="imageWorkbenchEnabled">{deferred(<ImageWorkbenchPage />)}</RequireFeature>
+                    </RequireAuth>
+                ),
+            },
+            {
+                path: "/toolbox/audio",
+                element: (
+                    <RequireAuth>
+                        <RequireFeature feature="audioWorkbenchEnabled">{deferred(<AudioWorkbenchPage />)}</RequireFeature>
                     </RequireAuth>
                 ),
             },

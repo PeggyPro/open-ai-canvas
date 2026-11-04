@@ -413,6 +413,10 @@ func TestMediaRecoveryExpiredLeaseAndStagingLimits(t *testing.T) {
 func TestMediaRecoveryAudioKeepsAllReturnedResults(t *testing.T) {
 	t.Setenv("CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS", "127.0.0.1")
 	s, db := newMediaRecoveryTestService(t)
+	// Key publication has separate tests; directory fsync is unavailable on Windows.
+	if err := os.WriteFile(filepath.Join(s.dataDir, ".settings-key"), make([]byte, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "audio/mpeg")
 		_, _ = w.Write([]byte("audio-result"))
@@ -433,7 +437,7 @@ func TestMediaRecoveryAudioKeepsAllReturnedResults(t *testing.T) {
 		{URL: server.URL + "/emotion.wav", MIMEType: "audio/mpeg"},
 	})
 	if !handled || recoveryErr != nil {
-		t.Fatalf("handled=%v err=%v", handled, recoveryErr)
+		t.Fatalf("handled=%v err=%v cause=%v", handled, recoveryErr, errors.Unwrap(recoveryErr))
 	}
 	audios, ok := result["audios"].([]interface{})
 	if !ok || len(audios) != 2 {

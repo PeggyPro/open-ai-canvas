@@ -2332,7 +2332,7 @@ paths:
         - in: query
           name: kind
           required: true
-          schema: { type: string, enum: [image, video] }
+          schema: { type: string, enum: [image, video, audio] }
         - in: query
           name: activeOnly
           schema: { type: boolean, default: false }
@@ -2359,7 +2359,7 @@ paths:
               additionalProperties: false
               required: [kind, prompt, model]
               properties:
-                kind: { type: string, enum: [image, video] }
+                kind: { type: string, enum: [image, video, audio] }
                 toolId: { type: string }
                 presetId: { type: string }
                 prompt: { type: string, minLength: 1, maxLength: 32000 }
@@ -2385,10 +2385,11 @@ paths:
                   type: object
                   additionalProperties: false
                   properties:
-                    kind: { type: string, enum: [image, video] }
+                    kind: { type: string, enum: [image, video, audio] }
                     toolId: { type: string }
                     presetId: { type: string }
                 parameters:
+                  description: 音频任务仅允许 audioVoice、audioFormat、audioSpeed、audioInstructions，不接受工具、预设或参考素材。
                   type: object
                   additionalProperties: false
                   properties:
@@ -2401,6 +2402,14 @@ paths:
                     resolution: { type: string }
                     generateAudio: { type: boolean }
                     watermark: { type: boolean }
+                    audioVoice: { type: string, maxLength: 256, default: alloy }
+                    audioFormat: { type: string, enum: [mp3, wav, opus, aac, flac, pcm], default: mp3 }
+                    audioSpeed:
+                      description: 语速范围 0.25 到 4，接受数值或数字字符串。
+                      oneOf:
+                        - { type: number, minimum: 0.25, maximum: 4 }
+                        - { type: string }
+                    audioInstructions: { type: string, maxLength: 4000 }
                 references:
                   type: array
                   maxItems: 20

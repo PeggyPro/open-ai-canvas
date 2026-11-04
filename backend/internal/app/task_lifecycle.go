@@ -71,6 +71,11 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	if err := json.Unmarshal([]byte(decryptedInput), &billingInput); err != nil {
 		return nil, err
 	}
+	if task.WorkbenchKind == WorkbenchKindAudio || workbenchKindFromTaskInput(billingInput, task.Type) == WorkbenchKindAudio {
+		if err := s.RequireFeature(FeatureAudioWorkbench); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.prepareLogicalTaskRetry(task, billingInput); err != nil {
 		return nil, err
 	}

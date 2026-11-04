@@ -3,6 +3,7 @@ import { getResourceAccess, resolveResourceAccessURL, resourceStorageKey } from 
 import type { GenerationTask } from "@/services/api/task-center";
 
 export type WorkbenchKind = "image" | "video";
+export type WorkbenchTaskKind = WorkbenchKind | "audio";
 
 export type WorkbenchPromptPreset = {
     id: string;
@@ -76,10 +77,10 @@ export type WorkbenchToolDirectory = {
 };
 
 export type CreateWorkbenchTaskInput = {
-    kind: WorkbenchKind;
+    kind: WorkbenchTaskKind;
     toolId?: string;
     presetId?: string;
-    workbench?: { kind: WorkbenchKind; toolId: string; presetId?: string };
+    workbench?: { kind: WorkbenchTaskKind; toolId: string; presetId?: string };
     prompt: string;
     model: string;
     logicalModelId?: string;
@@ -98,7 +99,7 @@ export type CreateWorkbenchTaskInput = {
 
 export type WorkbenchTaskBatch = { id: string; index: number; count: number };
 
-export async function listWorkbenchTasks(kind: WorkbenchKind, limit = 100, activeOnly = false, signal?: AbortSignal) {
+export async function listWorkbenchTasks(kind: WorkbenchTaskKind, limit = 100, activeOnly = false, signal?: AbortSignal) {
     const pageSize = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.trunc(limit))) : 100;
     return http.get<GenerationTask[]>("/workbench/tasks", {
         params: { kind, pageSize, activeOnly: activeOnly || undefined },

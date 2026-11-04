@@ -11,6 +11,7 @@ import (
 const (
 	WorkbenchKindImage = workbench.KindImage
 	WorkbenchKindVideo = workbench.KindVideo
+	WorkbenchKindAudio = workbench.KindAudio
 )
 
 type (
@@ -114,6 +115,10 @@ func (s *Service) CreateWorkbenchTask(userID string, req WorkbenchTaskInput, tra
 		if err := s.RequireFeature(FeatureVideoWorkbench); err != nil {
 			return nil, err
 		}
+	} else if req.Kind == WorkbenchKindAudio {
+		if err := s.RequireFeature(FeatureAudioWorkbench); err != nil {
+			return nil, err
+		}
 	} else {
 		return nil, BadAuthRequest("工作台类型无效")
 	}
@@ -143,6 +148,10 @@ func (s *Service) WorkbenchTasks(userID, kind string, activeOnly bool, limit int
 		if err := s.RequireFeature(FeatureVideoWorkbench); err != nil {
 			return nil, err
 		}
+	} else if kind == WorkbenchKindAudio {
+		if err := s.RequireFeature(FeatureAudioWorkbench); err != nil {
+			return nil, err
+		}
 	} else {
 		return nil, BadAuthRequest("工作台类型无效")
 	}
@@ -164,6 +173,12 @@ func (s *Service) resolveWorkbenchProviderConfig(userID, kind, operation, modelN
 		} {
 			if value, exists := parameters[inputKey]; exists {
 				config[configKey] = providerConfigOptionValue(value)
+			}
+		}
+	} else if kind == WorkbenchKindAudio {
+		for _, key := range []string{"audioVoice", "audioFormat", "audioSpeed", "audioInstructions"} {
+			if value, exists := parameters[key]; exists {
+				config[key] = providerConfigOptionValue(value)
 			}
 		}
 	} else {

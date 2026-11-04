@@ -5,6 +5,7 @@ import "time"
 const (
 	WorkbenchKindImage = "image"
 	WorkbenchKindVideo = "video"
+	WorkbenchKindAudio = "audio"
 )
 
 // WorkbenchTool is an administrator-managed public generation entry.

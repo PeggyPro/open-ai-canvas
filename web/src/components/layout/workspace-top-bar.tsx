@@ -28,6 +28,7 @@ const PAGE_TITLES: Record<string, string> = {
 const TOOLBOX_TITLES: Record<string, string> = {
     image: "图片生成",
     video: "视频生成",
+    audio: "音频生成",
 };
 
 export function WorkspaceTopBar({ sidebarOpen, onToggleSidebar }: { sidebarOpen: boolean; onToggleSidebar: () => void }) {

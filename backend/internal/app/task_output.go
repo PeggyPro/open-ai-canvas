@@ -243,6 +243,8 @@ func taskMediaPreviewWithPoster(raw string, taskType string) (string, string, st
 	defaultKind := "image"
 	if strings.Contains(strings.ToLower(taskType), "video") {
 		defaultKind = "video"
+	} else if strings.Contains(strings.ToLower(taskType), "audio") {
+		defaultKind = "audio"
 	}
 	previewURL, previewKind := findTaskMediaPreview(payload, defaultKind)
 	posterURL := findTaskMediaPoster(payload)
@@ -290,7 +292,7 @@ func findTaskMediaPreview(value any, hint string) (string, string) {
 		lower := strings.ToLower(text)
 		if strings.Contains(lower, ".mp4") || strings.Contains(lower, ".webm") || strings.Contains(lower, ".mov") {
 			kind = "video"
-		} else if kind != "video" {
+		} else if kind != "video" && kind != "audio" {
 			kind = "image"
 		}
 		return text, kind
@@ -301,7 +303,7 @@ func findTaskMediaPreview(value any, hint string) (string, string) {
 			}
 		}
 	case map[string]any:
-		for _, key := range []string{"images", "image", "video", "dataUrl", "url", "resultUrl", "outputUrl"} {
+		for _, key := range []string{"images", "image", "video", "audio", "dataUrl", "url", "resultUrl", "outputUrl"} {
 			child, exists := item[key]
 			if !exists {
 				continue
@@ -309,6 +311,8 @@ func findTaskMediaPreview(value any, hint string) (string, string) {
 			childHint := hint
 			if key == "video" {
 				childHint = "video"
+			} else if key == "audio" {
+				childHint = "audio"
 			} else if key == "images" || key == "image" {
 				childHint = "image"
 			}
@@ -372,7 +376,7 @@ func publicWorkbenchInput(input map[string]any) map[string]any {
 		return nil
 	}
 	kind := strings.TrimSpace(stringValue(metadata["workbenchKind"]))
-	if kind != model.WorkbenchKindImage && kind != model.WorkbenchKindVideo {
+	if kind != model.WorkbenchKindImage && kind != model.WorkbenchKindVideo && kind != model.WorkbenchKindAudio {
 		return nil
 	}
 	snapshot, _ := metadata["workbench"].(map[string]any)
@@ -421,6 +425,14 @@ func publicWorkbenchParameters(kind string, snapshot, input map[string]any) map[
 	parameters, _ := snapshot["parameters"].(map[string]any)
 	config, _ := input["config"].(map[string]any)
 	result := map[string]any{}
+	if kind == model.WorkbenchKindAudio {
+		for _, key := range []string{"audioVoice", "audioFormat", "audioSpeed", "audioInstructions"} {
+			if text, ok := firstWorkbenchValue(parameters[key], config[key]).(string); ok {
+				result[key] = text
+			}
+		}
+		return result
+	}
 	if kind == model.WorkbenchKindImage {
 		copyWorkbenchTextParameter(result, "size", parameters["size"])
 		copyWorkbenchTextParameter(result, "quality", parameters["quality"])

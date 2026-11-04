@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"yingce/backend/internal/kernel"
 	"yingce/backend/internal/model"
@@ -88,8 +89,16 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 	if req.Workbench != nil && (req.Workbench.Kind != req.Kind || strings.TrimSpace(req.Workbench.ToolID) != toolID || (strings.TrimSpace(req.Workbench.PresetID) != "" && strings.TrimSpace(req.Workbench.PresetID) != presetID)) {
 		return nil, kernel.BadAuthRequest("工作台任务范围字段不一致")
 	}
-	if !validKind(req.Kind) {
+	if !validKind(req.Kind) && req.Kind != KindAudio {
 		return nil, kernel.BadAuthRequest("工作台类型无效")
+	}
+	if req.Kind == KindAudio {
+		if toolID != "" || presetID != "" || len(req.References) != 0 {
+			return nil, kernel.BadAuthRequest("音频工作台目前仅支持文本转语音，请勿提交工具、预设或参考素材")
+		}
+		if utf8.RuneCountInString(req.Prompt) > 32000 {
+			return nil, kernel.BadAuthRequest("朗读文本不能超过 32000 字")
+		}
 	}
 	if toolID == "" && presetID != "" {
 		return nil, kernel.BadAuthRequest("使用提示词预设前必须选择创作工具")
@@ -166,7 +175,7 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 		}
 	}
 	metadata := map[string]any{"source": "workbench", "workbenchKind": req.Kind}
-	operation := "image"
+	operation := req.Kind
 	if req.Kind == KindVideo {
 		operation = videoOperation(refs)
 		// Provider adapters read the same operation and frame identities as admission.
@@ -238,7 +247,7 @@ func (s *Service) ResolveTask(userID string, req TaskInput) (*TaskResolution, er
 		workbenchSnapshot["presetId"], workbenchSnapshot["presetName"], workbenchSnapshot["presetVersion"] = preset.ID, preset.Name, preset.Version
 		workbenchSnapshot["presetPrompt"] = preset.PromptTemplate
 	}
-	return &TaskResolution{TaskType: map[string]string{KindImage: "canvas_image", KindVideo: "canvas_video"}[req.Kind], Operation: operation, Input: input, Parameters: parameters, Prompt: strings.TrimSpace(req.Prompt), Model: modelName, LogicalModelID: logicalModelID, ChannelID: channelID, Tool: tool, Preset: preset}, nil
+	return &TaskResolution{TaskType: map[string]string{KindImage: "canvas_image", KindVideo: "canvas_video", KindAudio: "canvas_audio"}[req.Kind], Operation: operation, Input: input, Parameters: parameters, Prompt: strings.TrimSpace(req.Prompt), Model: modelName, LogicalModelID: logicalModelID, ChannelID: channelID, Tool: tool, Preset: preset}, nil
 }
 
 func videoOperation(refs []TaskReference) string {
@@ -269,6 +278,7 @@ func normalizeTaskParameters(kind string, params map[string]any) (map[string]any
 	allowed := map[string]map[string]bool{
 		KindImage: {"size": true, "quality": true, "imageResolution": true, "count": true},
 		KindVideo: {"seconds": true, "ratio": true, "resolution": true, "generateAudio": true, "watermark": true},
+		KindAudio: {"audioVoice": true, "audioFormat": true, "audioSpeed": true, "audioInstructions": true},
 	}[kind]
 	if allowed == nil {
 		return nil, kernel.BadAuthRequest("工作台类型无效")
@@ -279,6 +289,43 @@ func normalizeTaskParameters(kind string, params map[string]any) (map[string]any
 			return nil, kernel.BadAuthRequest("生成参数包含不支持字段: " + key)
 		}
 		switch key {
+		case "audioVoice", "audioInstructions":
+			text, ok := value.(string)
+			text = strings.TrimSpace(text)
+			max := 256
+			if key == "audioInstructions" {
+				max = 4000
+			}
+			if !ok || utf8.RuneCountInString(text) > max {
+				return nil, kernel.BadAuthRequest("音频参数格式或长度无效: " + key)
+			}
+			normalized[key] = text
+		case "audioFormat":
+			text, ok := value.(string)
+			text = strings.ToLower(strings.TrimSpace(text))
+			if !ok || !map[string]bool{"mp3": true, "wav": true, "opus": true, "aac": true, "flac": true, "pcm": true}[text] {
+				return nil, kernel.BadAuthRequest("不支持的音频格式")
+			}
+			normalized[key] = text
+		case "audioSpeed":
+			var text string
+			switch number := value.(type) {
+			case string:
+				text = number
+			case float64:
+				text = strconv.FormatFloat(number, 'f', -1, 64)
+			case int:
+				text = strconv.Itoa(number)
+			case json.Number:
+				text = number.String()
+			default:
+				return nil, kernel.BadAuthRequest("语速必须为 0.25 到 4 之间的数值")
+			}
+			speed, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+			if err != nil || math.IsNaN(speed) || math.IsInf(speed, 0) || speed < 0.25 || speed > 4 {
+				return nil, kernel.BadAuthRequest("语速必须为 0.25 到 4 之间的数值")
+			}
+			normalized[key] = strconv.FormatFloat(speed, 'f', -1, 64)
 		case "size", "quality", "imageResolution", "ratio", "resolution":
 			text, ok := value.(string)
 			text = strings.TrimSpace(text)
