@@ -1,4 +1,4 @@
-﻿import { normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
+import { normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
 import { resourceFileUrl, resourceIdFromStorageKey, resolveResourceAccessURL } from "@/services/api/resources";
 import type { GenerationTask } from "@/services/api/task-center";
 import type { CreateWorkbenchTaskInput } from "@/services/api/workbench";
@@ -49,6 +49,26 @@ function parseRecord(value?: string) {
 }
 function text(value: unknown) {
     return typeof value === "string" ? value : "";
+}
+
+export function audioWorkbenchGenerationDurationMs(task: Pick<GenerationTask, "startedAt" | "completedAt">, now = Date.now()) {
+    const startedAt = task.startedAt ? Date.parse(task.startedAt) : Number.NaN;
+    const completedAt = task.completedAt ? Date.parse(task.completedAt) : now;
+    if (!Number.isFinite(startedAt) || !Number.isFinite(completedAt) || completedAt < startedAt) return undefined;
+    return completedAt - startedAt;
+}
+
+export function formatAudioWorkbenchGenerationDuration(milliseconds?: number) {
+    if (milliseconds === undefined || !Number.isFinite(milliseconds) || milliseconds < 0) return "";
+    if (milliseconds < 1000) return `${Math.round(milliseconds)} 毫秒`;
+    const totalSeconds = Math.round(milliseconds / 100) / 10;
+    if (totalSeconds < 60) return `${totalSeconds.toFixed(1).replace(/\.0$/, "")} 秒`;
+    const totalWholeSeconds = Math.round(milliseconds / 1000);
+    const hours = Math.floor(totalWholeSeconds / 3600);
+    const minutes = Math.floor((totalWholeSeconds % 3600) / 60);
+    const seconds = totalWholeSeconds % 60;
+    if (hours > 0) return `${hours} 小时 ${minutes} 分 ${seconds} 秒`;
+    return `${minutes} 分 ${seconds} 秒`;
 }
 
 export function audioWorkbenchSnapshot(task: GenerationTask) {

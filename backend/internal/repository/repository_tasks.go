@@ -32,6 +32,98 @@ func (r *Repository) TaskForUser(userID string, id string) (*model.Task, error) 
 	return &task, nil
 }
 
+// DeleteTerminalTask removes a task's history after it has reached a terminal state.
+// The conditional task delete is performed first in the same transaction as the
+// cleanup. This makes a late worker write lose the race instead of recreating or
+// modifying a task that the user already removed.
+func (r *Repository) DeleteTerminalTask(userID string, taskID string) error {
+	userID = strings.TrimSpace(userID)
+	taskID = strings.TrimSpace(taskID)
+	if userID == "" || taskID == "" {
+		return gorm.ErrRecordNotFound
+	}
+
+	return r.Transaction(func(repo *Repository) error {
+		tx := repo.db
+		deleted := tx.Where(
+			"id = ? AND user_id = ? AND status NOT IN ?",
+			taskID, userID, []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusRunning},
+		).Delete(&model.Task{})
+		if deleted.Error != nil {
+			return deleted.Error
+		}
+		if deleted.RowsAffected != 1 {
+			var task model.Task
+			if err := tx.Select("id", "status").First(&task, "id = ? AND user_id = ?", taskID, userID).Error; err != nil {
+				return err
+			}
+			// A terminal row can disappear between the conditional DELETE and this
+			// read when another delete wins the race. Report the same conflict so
+			// callers never mistake a state race for a successful deletion.
+			return ErrTaskStateConflict
+		}
+
+		// These rows are task history and have no meaning after the task itself is
+		// gone. Keep every delete scoped to the owner where the table carries one.
+		for _, item := range []struct {
+			model any
+			query string
+			args  []any
+		}{
+			{model: &model.TaskTextDelta{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.TaskLog{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.Result{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.ApiCallLog{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.RouteAttempt{}, query: "task_id = ?", args: []any{taskID}},
+		} {
+			if err := tx.Where(item.query, item.args...).Delete(item.model).Error; err != nil {
+				return err
+			}
+		}
+
+		// Preserve business records and generated resources. Remove only the
+		// historical task pointer or association; resource rows are intentionally
+		// left untouched so normal reference protection still applies.
+		for _, item := range []struct {
+			model any
+			query string
+			args  []any
+		}{
+			{model: &model.AssetRepresentation{}, query: "task_id = ?", args: []any{taskID}},
+			{model: &model.ShotArtifact{}, query: "task_id = ?", args: []any{taskID}},
+			{model: &model.CreationSubmission{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.DramaTake{}, query: "task_id = ?", args: []any{taskID}},
+			{model: &model.DramaJob{}, query: "task_id = ?", args: []any{taskID}},
+			{model: &model.AgentMemoryProposal{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.ResourceOffloadJob{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+			{model: &model.BillingOrder{}, query: "user_id = ? AND task_id = ?", args: []any{userID, taskID}},
+		} {
+			if err := tx.Model(item.model).Where(item.query, item.args...).Update("task_id", nil).Error; err != nil {
+				return err
+			}
+		}
+		// These are association rows, so deleting the association preserves the
+		// workflow/production record and avoids a dangling task foreign key.
+		for _, item := range []any{&model.WorkflowStepTask{}, &model.ProductionTaskLink{}} {
+			if err := tx.Where("task_id = ?", taskID).Delete(item).Error; err != nil {
+				return err
+			}
+		}
+		// A cloud-agent checkpoint can outlive a generated task. Clear only the
+		// direct control pointers; the run, transcript, and resource records stay.
+		if err := tx.Model(&model.CloudAgentExecution{}).
+			Where("user_id = ? AND (active_task_id = ? OR media_task_id = ?)", userID, taskID, taskID).
+			Updates(map[string]any{
+				"active_task_id": gorm.Expr("CASE WHEN active_task_id = ? THEN '' ELSE active_task_id END", taskID),
+				"media_task_id":  gorm.Expr("CASE WHEN media_task_id = ? THEN '' ELSE media_task_id END", taskID),
+				"updated_at":     time.Now(),
+			}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (r *Repository) ActiveTaskCountForUser(userID string) (int64, error) {
 	var count int64
 	err := r.db.Model(&model.Task{}).Where("user_id = ? AND status IN ?", userID, []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusRunning}).Count(&count).Error
@@ -406,6 +498,37 @@ func (r *Repository) TasksWithWorkbenchKind(userID string, limit int, projectID 
 	}
 	err := query.Order("created_at desc").Limit(limit).Find(&tasks).Error
 	return tasks, err
+}
+
+// TasksWithWorkbenchKindPage returns a stable terminal history page and its total.
+func (r *Repository) TasksWithWorkbenchKindPage(userID string, page int, pageSize int, projectID string, workbenchKind string) ([]model.Task, int64, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 100 {
+		pageSize = 50
+	}
+	query := r.db.Model(&model.Task{}).Where("user_id = ?", userID)
+	if strings.TrimSpace(projectID) != "" {
+		query = query.Where("project_id = ?", strings.TrimSpace(projectID))
+	}
+	query = query.Where("status NOT IN ?", []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusRunning})
+	if workbenchKind != "" {
+		taskType := "canvas_" + workbenchKind
+		if r.db.Dialector.Name() == "postgres" {
+			query = query.Where("(workbench_kind = ? AND type = ?) OR (type = ? AND input_json::jsonb -> 'metadata' ->> 'source' = ? AND input_json::jsonb -> 'metadata' ->> 'workbenchKind' = ?)", workbenchKind, taskType, taskType, "workbench", workbenchKind)
+		} else {
+			query = query.Where("(workbench_kind = ? AND type = ?) OR (type = ? AND json_extract(input_json, '$.metadata.source') = ? AND json_extract(input_json, '$.metadata.workbenchKind') = ?)", workbenchKind, taskType, taskType, "workbench", workbenchKind)
+		}
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var tasks []model.Task
+	err := query.Select("id", "project_id", "type", "workbench_kind", "status", "stage", "media_stage", "media_recovery_json", "progress", "prompt", "operation", "provider", "model", "input_json", "result_json", "billing_order_id", "provider_request_id", "provider_cancel_status", "provider_cancel_error", "provider_cancel_attempts", "provider_cancel_requested_at", "provider_cancelled_at", "provider_cancel_next_check_at", "attempts", "started_at", "completed_at", "created_at", "updated_at", "agent_run_id", "generation_id", "approval_id", "authorized_charge_microcredits", "execution_diagnostic_json", "cancellation_source", "cancellation_actor_id", "cancellation_requested_at").
+		Order("created_at desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&tasks).Error
+	return tasks, total, err
 }
 
 // SuccessfulWorkflowTasksForProject 返回需要补偿工作流产物的成功任务。

@@ -621,7 +621,8 @@ function taskWaitTimeoutMs(task?: GenerationTask) {
     if (type.includes("storyboard")) return 25 * 60 * 1000;
     if (type.includes("video")) return 125 * 60 * 1000;
     if (type.includes("image")) return 10 * 60 * 1000;
-    if (type.includes("text") || type.includes("audio")) return 12 * 60 * 1000;
+    if (type.includes("audio")) return 30 * 60 * 1000;
+    if (type.includes("text")) return 12 * 60 * 1000;
     return 10 * 60 * 1000;
 }
 

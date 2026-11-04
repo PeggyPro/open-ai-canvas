@@ -133,6 +133,18 @@ func RegisterTaskRoutes(r *gin.RouterGroup, svc *service.Service) {
 		}
 		ok(c, task)
 	})
+	r.DELETE("/tasks/:id", func(c *gin.Context) {
+		user, err := currentUser(c, svc)
+		if err != nil {
+			failService(c, err)
+			return
+		}
+		if err := svc.DeleteTask(user.ID, c.Param("id")); err != nil {
+			failService(c, err)
+			return
+		}
+		ok(c, nil)
+	})
 	r.POST("/tasks/:id/text-deltas", func(c *gin.Context) {
 		user, err := currentUser(c, svc)
 		if err != nil {

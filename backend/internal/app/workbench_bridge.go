@@ -14,6 +14,13 @@ const (
 	WorkbenchKindAudio = workbench.KindAudio
 )
 
+type WorkbenchTaskPage struct {
+	Active   []TaskSummary `json:"active"`
+	Items    []TaskSummary `json:"items"`
+	Total    int64         `json:"total"`
+	Page     int           `json:"page"`
+	PageSize int           `json:"pageSize"`
+}
 type (
 	WorkbenchToolInput   = workbench.ToolInput
 	WorkbenchPresetInput = workbench.PresetInput
@@ -158,6 +165,48 @@ func (s *Service) WorkbenchTasks(userID, kind string, activeOnly bool, limit int
 	return s.TasksWithOptions(userID, TaskListOptions{Limit: limit, ActiveOnly: activeOnly, WorkbenchKind: kind})
 }
 
+func (s *Service) WorkbenchTasksPage(userID, kind string, page, pageSize int) (*WorkbenchTaskPage, error) {
+	if kind == WorkbenchKindImage {
+		if err := s.RequireFeature(FeatureImageWorkbench); err != nil {
+			return nil, err
+		}
+	} else if kind == WorkbenchKindVideo {
+		if err := s.RequireFeature(FeatureVideoWorkbench); err != nil {
+			return nil, err
+		}
+	} else if kind == WorkbenchKindAudio {
+		if err := s.RequireFeature(FeatureAudioWorkbench); err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, BadAuthRequest("工作台类型无效")
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 50
+	}
+	active, err := s.TasksWithOptions(userID, TaskListOptions{Limit: 100, ActiveOnly: true, WorkbenchKind: kind})
+	if err != nil {
+		return nil, err
+	}
+	tasks, total, err := s.repo.TasksWithWorkbenchKindPage(userID, page, pageSize, "", kind)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.taskSummariesForUser(userID, tasks)
+	if err != nil {
+		return nil, err
+	}
+	if active == nil {
+		active = make([]TaskSummary, 0)
+	}
+	if items == nil {
+		items = make([]TaskSummary, 0)
+	}
+	return &WorkbenchTaskPage{Active: active, Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
 func (s *Service) resolveWorkbenchProviderConfig(userID, kind, operation, modelName, logicalModelID, channelID string, parameters map[string]any, input map[string]any) (map[string]any, error) {
 	config := map[string]any{"mode": kind}
 	if kind == WorkbenchKindImage {

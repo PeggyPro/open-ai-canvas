@@ -99,6 +99,22 @@ export type CreateWorkbenchTaskInput = {
 
 export type WorkbenchTaskBatch = { id: string; index: number; count: number };
 
+export type WorkbenchTaskPage = {
+    active: GenerationTask[];
+    items: GenerationTask[];
+    total: number;
+    page: number;
+    pageSize: number;
+};
+
+export async function listWorkbenchTaskPage(kind: WorkbenchTaskKind, page = 1, pageSize = 10, signal?: AbortSignal) {
+    const normalizedPage = Number.isFinite(page) ? Math.max(1, Math.trunc(page)) : 1;
+    const normalizedPageSize = Number.isFinite(pageSize) ? Math.max(1, Math.min(100, Math.trunc(pageSize))) : 10;
+    return http.get<WorkbenchTaskPage>("/workbench/tasks", {
+        params: { kind, page: normalizedPage, pageSize: normalizedPageSize },
+        signal,
+    });
+}
 export async function listWorkbenchTasks(kind: WorkbenchTaskKind, limit = 100, activeOnly = false, signal?: AbortSignal) {
     const pageSize = Number.isFinite(limit) ? Math.max(1, Math.min(100, Math.trunc(limit))) : 100;
     return http.get<GenerationTask[]>("/workbench/tasks", {

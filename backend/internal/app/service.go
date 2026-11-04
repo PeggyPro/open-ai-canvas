@@ -24,6 +24,8 @@ import (
 	"yingce/backend/internal/sms"
 	"yingce/backend/internal/tools"
 	"yingce/backend/internal/workbench"
+
+	"gorm.io/gorm"
 )
 
 type Service struct {
@@ -264,11 +266,7 @@ func (s *Service) Tasks(userID string, limit int) ([]TaskSummary, error) {
 	return s.TasksWithOptions(userID, TaskListOptions{Limit: limit})
 }
 
-func (s *Service) TasksWithOptions(userID string, options TaskListOptions) ([]TaskSummary, error) {
-	tasks, err := s.repo.TasksWithWorkbenchKind(userID, options.Limit, options.ProjectID, options.ActiveOnly, options.WorkbenchKind)
-	if err != nil {
-		return nil, err
-	}
+func (s *Service) taskSummariesForUser(userID string, tasks []model.Task) ([]TaskSummary, error) {
 	orders, err := s.repo.BillingOrdersByTaskIDs(userID, taskBillingTaskIDs(tasks))
 	if err != nil {
 		return nil, err
@@ -298,6 +296,14 @@ func (s *Service) TasksWithOptions(userID string, options TaskListOptions) ([]Ta
 	return taskSummariesForOutputWithBilling(tasks, orders), nil
 }
 
+func (s *Service) TasksWithOptions(userID string, options TaskListOptions) ([]TaskSummary, error) {
+	tasks, err := s.repo.TasksWithWorkbenchKind(userID, options.Limit, options.ProjectID, options.ActiveOnly, options.WorkbenchKind)
+	if err != nil {
+		return nil, err
+	}
+	return s.taskSummariesForUser(userID, tasks)
+}
+
 func (s *Service) Task(userID string, id string) (*model.Task, error) {
 	task, err := s.repo.TaskForUser(userID, id)
 	if err != nil {
@@ -305,6 +311,19 @@ func (s *Service) Task(userID string, id string) (*model.Task, error) {
 	}
 	s.hydrateTaskProviderRequestID(task)
 	return taskForOutput(*task), nil
+}
+
+func (s *Service) DeleteTask(userID string, id string) error {
+	if err := s.repo.DeleteTerminalTask(userID, id); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return NotFound("任务不存在")
+		}
+		if errors.Is(err, repository.ErrTaskStateConflict) {
+			return BadAuthRequest("进行中的任务不能删除，请先取消任务")
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Service) hydrateTaskProviderRequestID(task *model.Task) {

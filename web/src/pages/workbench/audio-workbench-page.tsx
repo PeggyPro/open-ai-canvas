@@ -1,21 +1,22 @@
-﻿import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { App, Button, Form, Input, InputNumber, Select, Spin, Tag } from "antd";
-import { AudioLines, Download, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { App, Button, Form, Input, InputNumber, Popconfirm, Select, Spin, Tag } from "antd";
+import { AudioLines, Download, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { ModelPicker } from "@/components/model-picker";
-import { PageHeader, WorkspacePage } from "@/components/layout/workspace-page";
+import { PageHeader, PaginationBar, WorkspacePage } from "@/components/layout/workspace-page";
 import { Callout } from "@/components/ui/product/callout/callout";
 import { openAIAudioFormatOptions, normalizeAudioFormatValue } from "@/lib/audio-generation";
-import { cancelGenerationTask, queryGenerationTask, retryGenerationTask, type GenerationTask } from "@/services/api/task-center";
-import { createWorkbenchTask, listWorkbenchTasks } from "@/services/api/workbench";
+import { cancelGenerationTask, deleteGenerationTask, queryGenerationTask, retryGenerationTask, type GenerationTask } from "@/services/api/task-center";
+import { createWorkbenchTask, listWorkbenchTaskPage } from "@/services/api/workbench";
 import { downloadBrowserMedia } from "@/services/browser-download";
 import { modelOptionName, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
-import { audioWorkbenchOutput, audioWorkbenchRequest, audioWorkbenchSnapshot, isSpeechWorkbenchModel } from "./audio-workbench";
+import { audioWorkbenchGenerationDurationMs, audioWorkbenchOutput, audioWorkbenchRequest, audioWorkbenchSnapshot, formatAudioWorkbenchGenerationDuration, isSpeechWorkbenchModel } from "./audio-workbench";
 import { isActiveWorkbenchTask, workbenchTaskStateLabel } from "./workbench-batches";
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : "操作失败，请稍后重试");
 const queryRoot = (userId: string) => ["audio-workbench", userId] as const;
+const HISTORY_PAGE_SIZE = 10;
 
 function AudioPlayback({ url }: { url: string }) {
     const [failed, setFailed] = useState(false);
@@ -30,7 +31,7 @@ function AudioPlayback({ url }: { url: string }) {
 function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; userId: string; onReuse: (task: GenerationTask) => void }) {
     const { message } = App.useApp();
     const queryClient = useQueryClient();
-    const [busy, setBusy] = useState<"retry" | "cancel" | "download" | null>(null);
+    const [busy, setBusy] = useState<"retry" | "cancel" | "download" | "delete" | null>(null);
     const detail = useQuery({
         queryKey: [...queryRoot(userId), "task", summary.id, summary.updatedAt],
         queryFn: ({ signal }) => queryGenerationTask(summary.id, { signal }),
@@ -42,12 +43,23 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
     const output = audioWorkbenchOutput(task);
     const snapshot = audioWorkbenchSnapshot(task);
     const active = isActiveWorkbenchTask(task);
-    const act = async (action: "retry" | "cancel" | "download") => {
+    const [, setElapsedTick] = useState(0);
+    useEffect(() => {
+        if (!active) return;
+        const timer = window.setInterval(() => setElapsedTick((tick) => tick + 1), 1000);
+        return () => window.clearInterval(timer);
+    }, [active]);
+    const generationDuration = formatAudioWorkbenchGenerationDuration(audioWorkbenchGenerationDurationMs(task));
+    const act = async (action: "retry" | "cancel" | "download" | "delete") => {
         if (busy) return;
         setBusy(action);
         try {
             if (action === "download") await downloadBrowserMedia({ ...output, variant: "original" });
-            else {
+            else if (action === "delete") {
+                await deleteGenerationTask(task.id);
+                await queryClient.invalidateQueries({ queryKey: queryRoot(userId) });
+                void message.success("已删除音频记录");
+            } else {
                 if (action === "retry") await retryGenerationTask(task.id);
                 else await cancelGenerationTask(task.id);
                 window.dispatchEvent(new CustomEvent("wallet:updated"));
@@ -76,6 +88,12 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
             {detail.data && (
                 <p className="text-xs text-muted-foreground">
                     音色：{snapshot.voice} · {snapshot.format.toUpperCase()} · 语速 {snapshot.speed}×
+                </p>
+            )}
+            {generationDuration && (
+                <p className="text-xs text-muted-foreground" title="从任务开始执行到完成的墙钟时间，不包含排队等待，也不是生成音频本身的播放时长">
+                    生成耗时：{generationDuration}
+                    {active ? "（进行中）" : "（不含排队）"}
                 </p>
             )}
             {active && (
@@ -118,6 +136,13 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
                         取消任务
                     </Button>
                 )}
+                {!active && (
+                    <Popconfirm title="确认删除这条音频记录？" description="删除后将从生成记录中移除，操作不可撤销。" okText="删除" okButtonProps={{ danger: true }} cancelText="取消" disabled={busy !== null} onConfirm={() => void act("delete")}>
+                        <Button danger icon={<Trash2 className="size-4" />} loading={busy === "delete"} disabled={busy !== null}>
+                            删除
+                        </Button>
+                    </Popconfirm>
+                )}
                 <Button type="text" disabled={!detail.data} onClick={() => onReuse(task)}>
                     使用这段文本和参数
                 </Button>
@@ -139,18 +164,25 @@ export default function AudioWorkbenchPage() {
     const [prompt, setPrompt] = useState("");
     const [submitting, setSubmitting] = useState(false);
     const [submitError, setSubmitError] = useState("");
-    const [visibleCount, setVisibleCount] = useState(8);
+    const [historyPage, setHistoryPage] = useState(1);
     const models = selectableModelsByCapability(config, "audio").filter((model) => isSpeechWorkbenchModel(config, model));
     const selectedModel = models.includes(config.audioModel) ? config.audioModel : models[0] || "";
     const history = useQuery({
-        queryKey: [...queryRoot(userId), "history"],
-        queryFn: ({ signal }) => listWorkbenchTasks("audio", 100, false, signal),
+        queryKey: [...queryRoot(userId), "history", historyPage],
+        queryFn: ({ signal }) => listWorkbenchTaskPage("audio", historyPage, HISTORY_PAGE_SIZE, signal),
         enabled: Boolean(userId) && enabled,
-        refetchInterval: (query) => (query.state.status === "error" ? false : query.state.data?.some(isActiveWorkbenchTask) ? 4000 : 15000),
+        refetchInterval: (query) => (query.state.status === "error" ? false : query.state.data?.active.some(isActiveWorkbenchTask) ? 4000 : 15000),
         refetchIntervalInBackground: false,
         retry: false,
     });
-    const tasks = history.data || [];
+    const activeTasks = history.data?.active || [];
+    const tasks = history.data?.items || [];
+    const totalHistory = history.data?.total || 0;
+    useEffect(() => {
+        if (!history.isSuccess) return;
+        const lastPage = Math.max(1, Math.ceil(totalHistory / HISTORY_PAGE_SIZE));
+        if (historyPage > lastPage) setHistoryPage(lastPage);
+    }, [history.isSuccess, historyPage, totalHistory]);
     const submit = async () => {
         if (submitting || !enabled) return;
         setSubmitError("");
@@ -159,6 +191,7 @@ export default function AudioWorkbenchPage() {
             if (!models.includes(selectedModel)) throw new Error("请选择可用的语音合成模型");
             const request = audioWorkbenchRequest(config, selectedModel, prompt);
             await createWorkbenchTask(request);
+            setHistoryPage(1);
             await queryClient.invalidateQueries({ queryKey: queryRoot(userId) });
             void message.success("音频任务已提交，可在生成记录中查看进度");
         } catch (error) {
@@ -244,7 +277,7 @@ export default function AudioWorkbenchPage() {
                 <section aria-label="音频生成记录" className="min-w-0 space-y-3">
                     <div className="flex items-center justify-between gap-3">
                         <h2 className="font-semibold">
-                            生成记录 <span className="text-xs font-normal text-muted-foreground">最近 100 条</span>
+                            生成记录 <span className="text-xs font-normal text-muted-foreground">{history.isSuccess ? `历史记录 ${totalHistory} 条 · 每页 ${HISTORY_PAGE_SIZE} 条` : `每页 ${HISTORY_PAGE_SIZE} 条`}</span>
                         </h2>
                         <Button icon={<RefreshCw className="size-4" />} loading={history.isFetching} onClick={() => void queryClient.invalidateQueries({ queryKey: queryRoot(userId) })}>
                             刷新
@@ -267,21 +300,30 @@ export default function AudioWorkbenchPage() {
                             加载记录失败：{errorText(history.error)}
                         </Callout>
                     )}
-                    {history.isSuccess && tasks.length === 0 && (
+                    {history.isSuccess && activeTasks.length > 0 && (
+                        <div className="space-y-3">
+                            <h3 className="text-sm font-semibold">进行中的任务</h3>
+                            {activeTasks.map((task) => (
+                                <AudioTaskCard key={task.id} summary={task} userId={userId} onReuse={reuse} />
+                            ))}
+                        </div>
+                    )}
+                    {history.isSuccess && tasks.length === 0 && activeTasks.length === 0 && (
                         <div className="rounded-xl border border-dashed border-border p-10 text-center text-muted-foreground">
                             <AudioLines className="mx-auto mb-3 size-8" aria-hidden />
                             <p className="text-sm">还没有音频记录</p>
                             <p className="mt-1 text-xs">输入朗读文本并生成，结果会自动保存在这里。</p>
                         </div>
                     )}
-                    {tasks.slice(0, visibleCount).map((task) => (
-                        <AudioTaskCard key={task.id} summary={task} userId={userId} onReuse={reuse} />
-                    ))}
-                    {tasks.length > visibleCount && (
-                        <Button block onClick={() => setVisibleCount((count) => count + 8)}>
-                            显示更多记录
-                        </Button>
+                    {history.isSuccess && tasks.length > 0 && (
+                        <div className="space-y-3">
+                            <h3 className="text-sm font-semibold">历史记录</h3>
+                            {tasks.map((task) => (
+                                <AudioTaskCard key={task.id} summary={task} userId={userId} onReuse={reuse} />
+                            ))}
+                        </div>
                     )}
+                    {history.isSuccess && totalHistory > 0 && <PaginationBar current={historyPage} pageSize={HISTORY_PAGE_SIZE} total={totalHistory} onChange={setHistoryPage} pageSizeOptions={[HISTORY_PAGE_SIZE]} alwaysShow itemLabel="条记录" />}
                 </section>
             </div>
         </WorkspacePage>

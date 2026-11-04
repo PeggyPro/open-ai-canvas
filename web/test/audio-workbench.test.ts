@@ -1,5 +1,5 @@
-﻿import { expect, test } from "bun:test";
-import { audioWorkbenchOutput, audioWorkbenchRequest, audioWorkbenchSnapshot, isSpeechWorkbenchModel } from "../src/pages/workbench/audio-workbench";
+import { expect, test } from "bun:test";
+import { audioWorkbenchGenerationDurationMs, audioWorkbenchOutput, audioWorkbenchRequest, audioWorkbenchSnapshot, formatAudioWorkbenchGenerationDuration, isSpeechWorkbenchModel } from "../src/pages/workbench/audio-workbench";
 import { defaultConfig, type AiConfig } from "../src/stores/use-config-store";
 import type { GenerationTask } from "../src/services/api/task-center";
 
@@ -46,6 +46,18 @@ test("history restores persisted options and tolerates malformed legacy input", 
         instructions: "warm",
     });
     expect(audioWorkbenchSnapshot(task({ inputJson: "broken" })).voice).toBe("alloy");
+});
+
+test("audio generation duration measures execution time rather than audio length", () => {
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const completedAt = "2026-01-01T00:00:12.345Z";
+    expect(audioWorkbenchGenerationDurationMs(task({ startedAt, completedAt }))).toBe(12345);
+    expect(audioWorkbenchGenerationDurationMs(task({ startedAt }), Date.parse("2026-01-01T00:00:03.250Z"))).toBe(3250);
+    expect(audioWorkbenchGenerationDurationMs(task({ startedAt: "invalid", completedAt }))).toBeUndefined();
+    expect(audioWorkbenchGenerationDurationMs(task({ startedAt: completedAt, completedAt: startedAt }))).toBeUndefined();
+    expect(formatAudioWorkbenchGenerationDuration(820)).toBe("820 毫秒");
+    expect(formatAudioWorkbenchGenerationDuration(12345)).toBe("12.3 秒");
+    expect(formatAudioWorkbenchGenerationDuration(62500)).toBe("1 分 3 秒");
 });
 
 test("audio output uses persisted resource identity before untrusted external URLs", () => {
