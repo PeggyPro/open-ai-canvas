@@ -16,6 +16,9 @@ go env GOMODCACHE
 # go run .\cmd\server
 & '..\.local\start-backend.cmd'
 
+# Agent 的 Node 依赖安装
+cd agent-runtime\pi
+npm ci
 
 
 # 终端二：前端
