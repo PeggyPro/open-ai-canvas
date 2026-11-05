@@ -55,6 +55,27 @@ func TestAgentMediaRetryRequiresNewGenerationAuthorization(t *testing.T) {
 	}
 }
 
+func TestRetryBlocksResultPersistenceRecoveryWithoutNewGeneration(t *testing.T) {
+	s, db, _ := agentMediaFixture(t)
+	task := model.Task{
+		ID: "audio-recover-result", UserID: "user", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		Status: model.TaskStatusFailed, InputJSON: `{}`, ExecutionDiagnosticJSON: `{"retryClass":"recover_result","submissionOutcome":"accepted"}`,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RetryTask(task.UserID, task.ID); err == nil || !strings.Contains(err.Error(), "结果保存失败") {
+		t.Fatalf("result-persistence recovery task was retried: %v", err)
+	}
+	stored, err := s.repo.Task(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != model.TaskStatusFailed || stored.BillingOrderID != "" {
+		t.Fatalf("blocked recovery retry changed task: %+v", stored)
+	}
+}
+
 func TestOrdinaryFailedAndCancelledTasksKeepRetryIdentity(t *testing.T) {
 	s, db, _ := agentMediaFixture(t)
 	for _, status := range []model.TaskStatus{model.TaskStatusFailed, model.TaskStatusCancelled} {

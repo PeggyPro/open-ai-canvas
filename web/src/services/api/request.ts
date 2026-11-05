@@ -49,6 +49,7 @@ export const apiClient = axios.create({ baseURL: apiBaseURL, withCredentials: tr
 export async function request<T>(promise: Promise<{ data: BackendEnvelope<T>; status?: number; headers?: unknown }>, options: { allowNotModified?: boolean } = {}) {
     try {
         const response = await promise;
+        if (response.status === 204) return undefined as T;
         if (response.status === 304 && options.allowNotModified) return { notModified: true } as T;
         if (response.data.code !== 0) {
             throw new ApiError(response.data.msg || "请求失败", {

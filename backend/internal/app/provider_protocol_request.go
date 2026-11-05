@@ -227,20 +227,20 @@ func executeProtocolBinaryRequest(ctx context.Context, config providerConfig, sp
 
 func executeProtocolBinaryRequestWithConsumer(ctx context.Context, config providerConfig, spec protocol.RequestSpec, consume func(string, []byte)) ([]byte, string, error) {
 	if err := spec.Validate(); err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	method := strings.ToUpper(strings.TrimSpace(spec.Method))
 	body, contentType, err := protocolRequestBody(ctx, config, spec)
 	if err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	requestURL, err := protocolRequestURL(config.BaseURL, spec)
 	if err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, requestURL, body)
 	if err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
@@ -250,7 +250,7 @@ func executeProtocolBinaryRequestWithConsumer(ctx context.Context, config provid
 	}
 	ApplyOutboundHeaders(req, config.Headers)
 	if err := applyProtocolAuth(req, config, spec.Auth); err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	if consume != nil {
 		req.Header.Set("Accept", "text/event-stream")

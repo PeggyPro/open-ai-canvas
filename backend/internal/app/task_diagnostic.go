@@ -18,6 +18,23 @@ func taskHasAgentOrigin(raw string) bool {
 	return json.Unmarshal([]byte(raw), &input) == nil && input.Metadata.Source == "cloud_agent"
 }
 
+func taskIsAudio(task *model.Task, input map[string]any) bool {
+	if task == nil {
+		return false
+	}
+	return task.WorkbenchKind == WorkbenchKindAudio ||
+		capabilityFromTaskType(task.Type) == "audio" ||
+		workbenchKindFromTaskInput(input, task.Type) == WorkbenchKindAudio
+}
+
+func taskHasFreePlatformRetry(task *model.Task, input map[string]any) bool {
+	if !taskIsAudio(task, input) {
+		return false
+	}
+	diagnostic := taskExecutionDiagnostic(task)
+	return diagnostic != nil && diagnostic.RetryClass == "platform_retry"
+}
+
 func safeTaskDiagnosticMessage(message string) string {
 	message = strings.TrimSpace(message)
 	if message == "" || !utf8.ValidString(message) || strings.ContainsAny(message, "\r\n\x00") {

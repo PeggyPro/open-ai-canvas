@@ -42,6 +42,14 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	if task.MediaRecoveryJSON != "" {
 		return nil, BadAuthRequest("作品已生成，请使用重试保存，不要重复生成")
 	}
+	if diagnostic := taskExecutionDiagnostic(task); diagnostic != nil {
+		switch diagnostic.RetryClass {
+		case "recover_result":
+			return nil, BadAuthRequest("上一次调用已成功但结果保存失败，请先完成结果核对后再重试")
+		case "reconcile_submission":
+			return nil, BadAuthRequest("上一次调用的结果或费用仍在核对中，处理完成前不能重复提交")
+		}
+	}
 	if task.CreationSubmissionID != nil {
 		return nil, creationConflict("智能创作重做需要新的报价批准，请回到创作会话继续")
 	}
@@ -82,9 +90,13 @@ func (w *taskLifecycleCoordinator) retryTask(userID string, id string) (*model.T
 	if err := s.requireCustomChannelsForTaskInput(billingInput); err != nil {
 		return nil, err
 	}
-	billingOrder, err := s.taskBillingOrder(userID, task, billingInput)
-	if err != nil {
-		return nil, err
+	freePlatformRetry := taskHasFreePlatformRetry(task, billingInput)
+	var billingOrder *model.BillingOrder
+	if !freePlatformRetry {
+		billingOrder, err = s.taskBillingOrder(userID, task, billingInput)
+		if err != nil {
+			return nil, err
+		}
 	}
 	policy, err := s.RuntimePolicy()
 	if err != nil {
@@ -142,6 +154,7 @@ func (w *taskLifecycleCoordinator) cancelTaskWithIntent(_ context.Context, userI
 		return nil, BadAuthRequest("第三方请求已提交，任务不可取消")
 	}
 	originalStatus := task.Status
+	upstreamSubmitted := taskUpstreamSubmitted(task)
 	now := time.Now()
 	if intent.RequestedAt.IsZero() {
 		intent.RequestedAt = now
@@ -200,7 +213,11 @@ func (w *taskLifecycleCoordinator) cancelTaskWithIntent(_ context.Context, userI
 		}
 	} else {
 		var billingErr error
-		if originalStatus == model.TaskStatusQueued {
+		if !upstreamSubmitted && taskIsAudio(task, nil) {
+			// 音频只有在真正执行前才结算；排队或准备阶段取消时释放预留，
+			// 不创建退款账务，也不留下可恢复为已消费的订单。
+			billingErr = s.taskBilling().ReleaseBillingReservation(task.BillingOrderID, "任务取消且上游请求未发出；来源："+intent.Source)
+		} else if !upstreamSubmitted {
 			billingErr = s.taskBilling().RefundBilling(task.BillingOrderID, "任务取消且尚未开始执行；来源："+intent.Source)
 		} else {
 			// running 任务可能已经发起上游调用但尚未把 request ID 写回，不能

@@ -104,11 +104,11 @@ func postStreamingBinary(ctx context.Context, config providerConfig, path string
 func postJSON(ctx context.Context, config providerConfig, path string, body interface{}, target interface{}) error {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("序列化上游请求失败：%w", err)
+		return providerRequestNotStartedError{Err: fmt.Errorf("序列化上游请求失败：%w", err)}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL(config.BaseURL, path), bytes.NewReader(data))
 	if err != nil {
-		return err
+		return providerRequestNotStartedError{Err: err}
 	}
 	applyProviderAuth(req, config)
 	req.Header.Set("Content-Type", "application/json")
@@ -153,11 +153,11 @@ func getJSON(ctx context.Context, config providerConfig, path string, target int
 func postBinary(ctx context.Context, config providerConfig, path string, body interface{}) ([]byte, string, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return nil, "", fmt.Errorf("序列化上游请求失败：%w", err)
+		return nil, "", providerRequestNotStartedError{Err: fmt.Errorf("序列化上游请求失败：%w", err)}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL(config.BaseURL, path), bytes.NewReader(data))
 	if err != nil {
-		return nil, "", err
+		return nil, "", providerRequestNotStartedError{Err: err}
 	}
 	req.Header.Set("Authorization", "Bearer "+config.APIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -217,10 +217,12 @@ func doJSON(req *http.Request, target interface{}) error {
 	}
 	if payload, ok := target.(*imageResponse); ok {
 		if payload.Error != nil && payload.Error.Message != "" {
-			return errors.New(providerPayloadErrorMessage(payload.Error.Message))
+			rawMessage := payload.Error.Message
+			return providerPayloadError{raw: rawMessage, message: providerPayloadErrorMessage(rawMessage)}
 		}
 		if payload.Code != nil && *payload.Code != 0 {
-			return errors.New(providerPayloadErrorMessage(payload.Msg))
+			rawMessage := payload.Msg
+			return providerPayloadError{raw: rawMessage, message: providerPayloadErrorMessage(rawMessage)}
 		}
 	}
 	if payload, ok := target.(*map[string]interface{}); ok {
@@ -239,6 +241,17 @@ func doBinary(req *http.Request) ([]byte, string, error) {
 	return doBinaryWithConsumer(req, nil)
 }
 
+func settleAudioBillingBeforeProviderRequest(req *http.Request, requestKind string) error {
+	metadata, ok := req.Context().Value(providerAnalyticsKey{}).(providerAnalyticsContext)
+	if !ok || metadata.Capability != "audio" || requestKind != "create" || metadata.Billing == nil || metadata.BillingOrderID == "" {
+		return nil
+	}
+	if err := metadata.Billing.SettleBilling(metadata.BillingOrderID, metadata.ProviderRequestID); err != nil {
+		return billingSettlementError{Err: err}
+	}
+	return nil
+}
+
 // doBinaryWithConsumer 是 Provider 出站响应的统一安全边界。JSON、SSE 和媒体下载最终都在这里执行
 // 渠道并发/熔断、SSRF、超时、响应大小、HTTP 状态和审计检查；onChunk 仅观察已读取的流片段，
 // 不会绕过完整响应的大小上限或错误判定。
@@ -254,6 +267,9 @@ func doBinaryWithConsumer(req *http.Request, onChunk func(string, []byte)) ([]by
 	var coordinator *platform.Coordinator
 	var runtimeService *Service
 	requestKind := providerRequestKindFromContext(req.Context())
+	if requestKind == "" {
+		requestKind = providerRequestKind(req.Method, req.URL.Path)
+	}
 	cacheManagementRequest := requestKind == "cache-create" || requestKind == "cache-delete"
 	responseLimit := maxProviderResponseBytes
 	channelID := ""
@@ -265,7 +281,7 @@ func doBinaryWithConsumer(req *http.Request, onChunk func(string, []byte)) ([]by
 		channelProxyURL = metadata.ProxyURL
 		policy, err := metadata.Service.RuntimePolicy()
 		if err != nil {
-			err = fmt.Errorf("读取生成资源限制失败：%w", err)
+			err = providerRequestNotStartedError{Err: fmt.Errorf("读取生成资源限制失败：%w", err)}
 			recordProviderRequest(req, startedAt, 0, nil, err)
 			return nil, "", err
 		}
@@ -273,12 +289,12 @@ func doBinaryWithConsumer(req *http.Request, onChunk func(string, []byte)) ([]by
 		if !cacheManagementRequest {
 			open, err := coordinator.CircuitOpen(req.Context(), channelID)
 			if err != nil {
-				err = fmt.Errorf("读取渠道熔断状态失败：%w", err)
+				err = providerRequestNotStartedError{Err: fmt.Errorf("读取渠道熔断状态失败：%w", err)}
 				recordProviderRequest(req, startedAt, 0, nil, err)
 				return nil, "", err
 			}
 			if open {
-				err = providerCircuitOpenError{}
+				err = providerRequestNotStartedError{Err: providerCircuitOpenError{}}
 				recordProviderRequest(req, startedAt, 0, nil, err)
 				return nil, "", err
 			}
@@ -291,6 +307,7 @@ func doBinaryWithConsumer(req *http.Request, onChunk func(string, []byte)) ([]by
 			metadata.ConcurrencyLimit = concurrencyLimit
 			req = req.WithContext(context.WithValue(req.Context(), providerAnalyticsKey{}, metadata))
 			if err != nil {
+				err = providerRequestNotStartedError{Err: err}
 				recordProviderRequest(req, startedAt, 0, nil, err)
 				return nil, "", err
 			}
@@ -300,10 +317,15 @@ func doBinaryWithConsumer(req *http.Request, onChunk func(string, []byte)) ([]by
 		}
 	}
 	if _, err := ValidateOutboundURL(req.URL.String()); err != nil {
+		err = providerRequestNotStartedError{Err: err}
 		recordProviderRequest(req, startedAt, 0, nil, err)
 		return nil, "", err
 	}
 	ApplyDefaultOutboundHeaders(req)
+	if err := settleAudioBillingBeforeProviderRequest(req, requestKind); err != nil {
+		recordProviderRequest(req, startedAt, 0, nil, err)
+		return nil, "", err
+	}
 	client := OutboundHTTPClientWithProxy(requestTimeout, channelProxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -455,7 +477,11 @@ func recordProviderRequest(req *http.Request, startedAt time.Time, statusCode in
 	metadata.Service.EnrichAPICallLog(&callLog, responseBody)
 	callLog.Error = withUserVisibleLogError(requestErr, callLog.Error)
 	if err := metadata.Service.LogAPICall(callLog); err != nil {
-		if !channelSlotFailure && metadata.Billing != nil {
+		// 本地策略、熔断、并发槽、SSRF 和请求构造失败都发生在
+		// client.Do 之前；这些错误不会消耗音频预留，不能因为审计日志
+		// 再失败一次就把订单冻结为待核对。进入出站边界后的错误仍需保留
+		// 原有的账务核对保护。
+		if !channelSlotFailure && requestKind != "upload" && !providerRequestNotStarted(requestErr) && metadata.Billing != nil {
 			if uncertainErr := metadata.Billing.MarkBillingUncertain(metadata.BillingOrderID, "上游调用日志写入失败，费用状态待核对"); uncertainErr != nil {
 				// 这里无法把日志落库错误返回给已完成的 HTTP 请求，只能把计费边界失败写入进程日志，交给待核对审计继续处理。
 				log.Printf("provider billing uncertainty update failed: task_id=%s billing_order_id=%s error=%v", metadata.TaskID, metadata.BillingOrderID, uncertainErr)

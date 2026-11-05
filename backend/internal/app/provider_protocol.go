@@ -76,11 +76,11 @@ func runProtocolAdapterTaskWithPolicy(ctx context.Context, input canvasGeneratio
 		}
 		spec, err := adapter.BuildCreate(ctx, protocol.RequestContext{BaseURL: input.Config.BaseURL, Request: request})
 		if err != nil {
-			return nil, err
+			return nil, providerExecutionPhaseError{Phase: "preparation", Err: err}
 		}
 		body, streamedResult, err := executeIdempotentProtocolCreate(ctx, input, spec, adapter.Metadata().IdempotentCreate)
 		if err != nil {
-			return nil, err
+			return nil, providerExecutionPhaseError{Phase: "create", Err: err}
 		}
 		if streamedResult != nil {
 			created = protocol.CreateResult{Status: protocol.StatusSucceeded, Result: streamedResult}
@@ -92,18 +92,18 @@ func runProtocolAdapterTaskWithPolicy(ctx context.Context, input canvasGeneratio
 			}
 		}
 		if err != nil {
-			return nil, err
+			return nil, providerExecutionPhaseError{Phase: "create", Err: err}
 		}
 		taskID = created.TaskID
 		if taskID == "" {
 			extracted, extractErr := extractProviderTaskID(body)
 			if extractErr != nil {
-				return nil, extractErr
+				return nil, providerExecutionPhaseError{Phase: "create", Err: extractErr}
 			}
 			taskID = extracted
 		}
 		if created.Status == protocol.StatusFailed || created.Status == protocol.StatusCancelled {
-			return nil, protocolResultError(created.Message, taskID)
+			return nil, providerExecutionPhaseError{Phase: "create", Err: protocolResultError(created.Message, taskID)}
 		}
 		if created.Status == protocol.StatusSucceeded {
 			return finishProtocolAdapterResult(ctx, input, adapter, request, taskID, created.Result, policy)

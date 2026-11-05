@@ -16,7 +16,7 @@ export function logStatus(log: Pick<ApiCallLog, "status" | "providerStatus">) {
 export function logBillingLabel(log: Pick<ApiCallLog, "billable" | "billingAvailable" | "billingStatus">) {
     if (!log.billable) return "不计费";
     if (!log.billingAvailable) return "未扣积分";
-    const labels = { settled: "已结算", refunded: "已退回", uncertain: "待核对", running: "运行中", reserved: "已预授权" };
+    const labels = { settled: "已结算", refunded: "已退回", released: "预授权已释放", uncertain: "待核对", running: "运行中", reserved: "已预授权" };
     return log.billingStatus ? labels[log.billingStatus] : "已预授权";
 }
 

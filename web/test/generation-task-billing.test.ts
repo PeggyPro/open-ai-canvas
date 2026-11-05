@@ -25,6 +25,12 @@ describe("task billing display", () => {
         }
     });
 
+    test("released shows that the preauthorization was released", () => {
+        const billing: Billing = { ...hold, status: "released" };
+        expect(taskBillingDisplay(billing)).toEqual({ amount: "1", note: "预授权已释放", refundNote: "", tone: "released" });
+        expect(taskBillingLabel(billing)).toBe("预授权已释放 1 积分");
+    });
+
     test("refunded and uncertain keep their own labels", () => {
         expect(taskBillingDisplay({ ...hold, status: "refunded", refundedMicrocredits: 1_000_000 })).toMatchObject({ note: "已退回", amount: "1", tone: "refunded" });
         expect(taskBillingDisplay({ ...hold, status: "uncertain" })).toMatchObject({ note: "待核对", tone: "uncertain" });

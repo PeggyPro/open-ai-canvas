@@ -180,9 +180,16 @@ func (r *Repository) RetryTaskWithBilling(userID string, prepared *model.Task, o
 				return err
 			}
 		}
+		executionDiagnostic := ""
+		if order == nil {
+			// A free audio platform retry must retain the durable retry class so
+			// repeated user-triggered retries remain free and do not create a new
+			// billing order.
+			executionDiagnostic = prepared.ExecutionDiagnosticJSON
+		}
 		updates := map[string]any{
 			"status": model.TaskStatusQueued, "stage": "等待队列调度", "progress": 5, "error": "", "result_json": "",
-			"execution_diagnostic_json": "", "cancellation_source": "", "cancellation_actor_id": "", "cancellation_requested_at": nil,
+			"execution_diagnostic_json": executionDiagnostic, "cancellation_source": "", "cancellation_actor_id": "", "cancellation_requested_at": nil,
 			"text_draft": "", "started_at": nil, "completed_at": nil,
 			"provider_request_id": "", "poll_stage": "", "next_poll_at": nil,
 			"provider_cancel_status": "", "provider_cancel_error": "", "provider_cancel_attempts": 0,

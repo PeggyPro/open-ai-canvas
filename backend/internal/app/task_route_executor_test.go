@@ -16,6 +16,7 @@ type taskRouteExecutionPortStub struct {
 	nextAttempts   map[string]*model.RouteAttempt
 	nextErrors     map[string]error
 	processResults map[string]taskRouteExecutionStubResult
+	refreshErr     error
 }
 
 type taskRouteExecutionStubResult struct {
@@ -37,7 +38,7 @@ func (p *taskRouteExecutionPortStub) processTask(_ context.Context, task model.T
 }
 
 func (p *taskRouteExecutionPortStub) refreshTaskProviderState(*model.Task) error {
-	return nil
+	return p.refreshErr
 }
 
 func (p *taskRouteExecutionPortStub) finishTaskRouteAttempt(attempt *model.RouteAttempt, _ *model.Task, taskErr error) {
@@ -88,6 +89,53 @@ func TestTaskRouteExecutorSwitchesOnlyWhenNextRouteIsAvailable(t *testing.T) {
 	}
 	if len(p.logs) != 1 || p.logs[0] != "上游未创建任务，切换备用能力路由:route-b" {
 		t.Fatalf("route switch logs = %v", p.logs)
+	}
+}
+
+func TestTaskRouteExecutorSurfacesProviderResultWhenStateRefreshFails(t *testing.T) {
+	first := &model.RouteAttempt{RouteID: "route-a"}
+	stateErr := errors.New("刷新任务上游状态失败：database unavailable")
+	p := &taskRouteExecutionPortStub{
+		refreshErr: stateErr,
+		processResults: map[string]taskRouteExecutionStubResult{
+			"route-a": {result: map[string]interface{}{"ok": true}},
+		},
+	}
+	task := &model.Task{ID: "task-1", UserID: "user-1", RouteID: "route-a"}
+
+	result, err := (&taskRouteExecutor{port: p}).execute(context.Background(), task, first)
+	if err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+	if !result.providerSucceeded || !errors.Is(result.err, stateErr) {
+		t.Fatalf("unexpected execution result: %+v", result)
+	}
+	if len(p.finished) != 0 || len(p.processCalls) != 1 {
+		t.Fatalf("state refresh failure should stop route finalization/failover: calls=%v finished=%v", p.processCalls, p.finished)
+	}
+}
+
+func TestTaskRouteExecutorPreservesNotStartedProviderFailureWhenStateRefreshFails(t *testing.T) {
+	first := &model.RouteAttempt{RouteID: "route-a"}
+	providerErr := providerRequestNotStartedError{Err: errors.New("provider request was blocked before dispatch")}
+	stateErr := errors.New("刷新任务上游状态失败：database unavailable")
+	p := &taskRouteExecutionPortStub{
+		refreshErr: stateErr,
+		processResults: map[string]taskRouteExecutionStubResult{
+			"route-a": {err: providerErr},
+		},
+	}
+	task := &model.Task{ID: "task-1", UserID: "user-1", RouteID: "route-a"}
+
+	result, err := (&taskRouteExecutor{port: p}).execute(context.Background(), task, first)
+	if err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+	if result.providerSucceeded || !errors.Is(result.err, providerErr) || !errors.Is(result.err, stateErr) {
+		t.Fatalf("unexpected execution result: %+v", result)
+	}
+	if len(p.finished) != 0 || len(p.processCalls) != 1 {
+		t.Fatalf("state refresh failure should preserve the unsubmitted provider failure: calls=%v finished=%v", p.processCalls, p.finished)
 	}
 }
 

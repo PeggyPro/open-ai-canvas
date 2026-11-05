@@ -118,25 +118,47 @@ func (s *Service) reconcileProviderCancellation(ctx context.Context, task *model
 
 	switch outcome {
 	case providerCancellationConfirmed:
-		if err := billing.RefundBilling(task.BillingOrderID, "上游已确认取消"); err != nil {
-			return s.deferProviderCancellation(task, "上游已取消，但积分退回失败："+err.Error())
+		var billingErr error
+		if taskIsAudio(task, nil) {
+			billingErr = billing.SettleBilling(task.BillingOrderID, task.ProviderRequestID)
+		} else {
+			billingErr = billing.RefundBilling(task.BillingOrderID, "上游已确认取消")
+		}
+		if billingErr != nil {
+			return s.deferProviderCancellation(task, "上游已取消，但计费收尾失败："+billingErr.Error())
 		}
 		now := time.Now()
 		if err := s.repo.UpdateTaskProviderCancellation(task.ID, model.ProviderCancelStatusRequested, model.ProviderCancelStatusConfirmed, "", nil, &now); err != nil {
 			return err
 		}
-		_ = s.log(task.UserID, task.ID, "info", "上游已确认取消，积分已退回", providerStatus)
+		message := "上游已确认取消，积分已退回"
+		if taskIsAudio(task, nil) {
+			message = "上游已确认取消，音频费用已消费"
+		}
+		_ = s.log(task.UserID, task.ID, "info", message, providerStatus)
 	case providerCancellationSucceeded:
 		errorText := "取消请求发出前上游已完成，费用已结算"
 		var billingErr error
+		billingStateWriteFailed := false
 		if err := billing.SettleBilling(task.BillingOrderID, task.ProviderRequestID); err != nil {
 			errorText = "取消请求发出前上游已完成，但费用结算失败，需人工核对：" + err.Error()
 			billingErr = fmt.Errorf("取消确认后的计费结算失败：%w", err)
 			if uncertainErr := billing.MarkBillingUncertain(task.BillingOrderID, errorText); uncertainErr != nil {
+				billingStateWriteFailed = true
 				billingErr = errors.Join(billingErr, fmt.Errorf("记录取消确认后的计费待核对状态失败：%w", uncertainErr))
 			}
 		}
-		if err := s.repo.UpdateTaskProviderCancellation(task.ID, model.ProviderCancelStatusRequested, model.ProviderCancelStatusUncertain, errorText, nil, nil); err != nil {
+		cancelStatus := model.ProviderCancelStatusUncertain
+		var nextCheckAt *time.Time
+		if billingStateWriteFailed {
+			// The provider outcome is known, but the billing uncertainty marker did
+			// not persist. Keep this task claimable so the billing reconciliation is
+			// retried; never release or refund the consumed audio order here.
+			cancelStatus = model.ProviderCancelStatusRequested
+			next := time.Now().Add(30 * time.Second)
+			nextCheckAt = &next
+		}
+		if err := s.repo.UpdateTaskProviderCancellation(task.ID, model.ProviderCancelStatusRequested, cancelStatus, errorText, nextCheckAt, nil); err != nil {
 			return err
 		}
 		_ = s.log(task.UserID, task.ID, "warn", "上游任务在取消确认前已完成", providerStatus)
@@ -144,9 +166,16 @@ func (s *Service) reconcileProviderCancellation(ctx context.Context, task *model
 			return billingErr
 		}
 	case providerCancellationFailed:
-		errorText := "上游任务已失败，取消状态无法确认，积分已退回"
-		if err := billing.RefundBilling(task.BillingOrderID, errorText); err != nil {
-			return s.deferProviderCancellation(task, "上游任务已失败，但积分退回失败："+err.Error())
+		errorText := "上游任务已失败，取消状态无法确认，费用已消费"
+		var billingErr error
+		if taskIsAudio(task, nil) {
+			billingErr = billing.SettleBilling(task.BillingOrderID, task.ProviderRequestID)
+		} else {
+			errorText = "上游任务已失败，取消状态无法确认，积分已退回"
+			billingErr = billing.RefundBilling(task.BillingOrderID, errorText)
+		}
+		if billingErr != nil {
+			return s.deferProviderCancellation(task, "上游任务已失败，但计费收尾失败："+billingErr.Error())
 		}
 		if err := s.repo.UpdateTaskProviderCancellation(task.ID, model.ProviderCancelStatusRequested, model.ProviderCancelStatusUncertain, errorText, nil, nil); err != nil {
 			return err
@@ -170,7 +199,21 @@ func (s *Service) markProviderCancellationUncertain(task *model.Task, errorText 
 		return err
 	}
 	if err := s.taskBilling().MarkBillingUncertain(task.BillingOrderID, message); err != nil {
+		// The provider result is still uncertain and the billing order must stay
+		// protected. Requeue only because the uncertainty marker itself failed.
+		next := time.Now().Add(30 * time.Second)
+		retryErr := s.repo.UpdateTaskProviderCancellation(
+			task.ID,
+			model.ProviderCancelStatusUncertain,
+			model.ProviderCancelStatusRequested,
+			message+"；计费状态更新失败，等待重试："+safeProviderLogError(err),
+			&next,
+			nil,
+		)
 		_ = s.log(task.UserID, task.ID, "error", "上游取消已转入人工核对，但计费状态更新失败", err.Error())
+		if retryErr != nil {
+			return errors.Join(err, retryErr)
+		}
 		return err
 	}
 	_ = s.log(task.UserID, task.ID, "warn", "上游取消无法确认", message)

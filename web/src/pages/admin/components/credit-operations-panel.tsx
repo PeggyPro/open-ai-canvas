@@ -29,6 +29,7 @@ const billingStatusLabels = {
     reserved: "已预授权",
     settled: "已结算",
     refunded: "已退款",
+    released: "预授权已释放",
 } satisfies Record<BillingOrder["status"], string>;
 
 export default function CreditOperationsPanel({ users, activeOperation, onOperationChange }: { users: AdminReferenceData["users"]; activeOperation: CreditOperation; onOperationChange: (operation: CreditOperation) => void }) {
@@ -328,8 +329,8 @@ export default function CreditOperationsPanel({ users, activeOperation, onOperat
                             {order.usageSource === "video_formula"
                                 ? `公式结算 · ${order.outputTokens.toLocaleString()} 视频 Token`
                                 : order.capability === "video"
-                                    ? `上游用量 · ${order.outputTokens.toLocaleString()} 视频 Token`
-                                    : `输入 ${order.inputTokens} · 输出 ${order.outputTokens} · 缓存 ${order.cachedTokens}`}
+                                  ? `上游用量 · ${order.outputTokens.toLocaleString()} 视频 Token`
+                                  : `输入 ${order.inputTokens} · 输出 ${order.outputTokens} · 缓存 ${order.cachedTokens}`}
                         </div>
                     </div>
                 ) : (
@@ -341,7 +342,7 @@ export default function CreditOperationsPanel({ users, activeOperation, onOperat
             dataIndex: "status",
             width: 110,
             align: "center",
-            render: (value: BillingOrder["status"]) => <AdminStatusBadge label={billingStatusLabels[value]} tone={value === "settled" ? "success" : value === "refunded" ? "neutral" : "warning"} />,
+            render: (value: BillingOrder["status"]) => <AdminStatusBadge label={billingStatusLabels[value]} tone={value === "settled" ? "success" : value === "refunded" || value === "released" ? "neutral" : "warning"} />,
         },
         { title: "上游请求", dataIndex: "providerRequestId", width: 180, ellipsis: true, render: (value) => value || "未获取" },
         { title: "核对原因", dataIndex: "error", width: 260, ellipsis: true, render: (value) => value || "费用状态不明确" },
@@ -405,6 +406,7 @@ export default function CreditOperationsPanel({ users, activeOperation, onOperat
                                 { label: "已预授权", value: "reserved" },
                                 { label: "已结算", value: "settled" },
                                 { label: "已退款", value: "refunded" },
+                                { label: "预授权已释放", value: "released" },
                             ]}
                         />
                     }

@@ -143,7 +143,7 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
                         </Button>
                     </Popconfirm>
                 )}
-                <Button type="text" disabled={!detail.data} onClick={() => onReuse(task)}>
+                <Button type="default" disabled={!detail.data} onClick={() => onReuse(task)}>
                     使用这段文本和参数
                 </Button>
                 <span className="ml-auto text-xs text-muted-foreground" title={task.id}>

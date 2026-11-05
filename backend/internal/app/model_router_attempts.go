@@ -500,15 +500,35 @@ func safeRouteRejection(err error) bool {
 	if err == nil {
 		return false
 	}
-	if code, _ := ChannelSlotFailureDetails(err); code != "" {
-		return true
+	var settlementErr billingSettlementError
+	if errors.As(err, &settlementErr) {
+		return false
 	}
 	var upstream providerHTTPError
 	if errors.As(err, &upstream) {
+		if upstream.StatusCode == 524 {
+			// A gateway timeout can leave provider work running. The protocol
+			// phase may prove that create was not reached for an upload, but it
+			// never proves that the upstream accepted no work at all.
+			return false
+		}
+		// Preserve the existing route-switch policy for channel/model auth,
+		// discovery and rate-limit responses. They prove no generation job was
+		// accepted even when the request was wrapped in a protocol phase.
 		switch upstream.StatusCode {
 		case 401, 403, 404, 429:
 			return true
 		}
+	}
+	if providerRequestDefinitelyNotSubmitted(err) {
+		message := strings.ToLower(err.Error())
+		if providerErrorLooksUserCaused(message) || providerErrorLooksUserCaused(strings.ToLower(upstream.Body)) {
+			return false
+		}
+		return true
+	}
+	if code, _ := ChannelSlotFailureDetails(err); code != "" {
+		return true
 	}
 	return false
 }

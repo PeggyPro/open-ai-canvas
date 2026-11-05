@@ -19,6 +19,7 @@ type taskBillingCoordinator struct {
 
 type taskBillingRepository interface {
 	MarkBillingRunning(orderID string) error
+	ReleaseBillingReservation(orderID string, reason string) error
 	SettleBillingOrder(orderID string, providerRequestID string) error
 	RestoreRefundedBillingOrder(orderID string, providerRequestID string) error
 	RefundBillingOrder(orderID string, errorText string) error
@@ -41,6 +42,13 @@ func (c *taskBillingCoordinator) MarkBillingRunning(orderID string) error {
 		return nil
 	}
 	return c.repo.MarkBillingRunning(orderID)
+}
+
+func (c *taskBillingCoordinator) ReleaseBillingReservation(orderID string, reason string) error {
+	if orderID == "" {
+		return nil
+	}
+	return c.repo.ReleaseBillingReservation(orderID, reason)
 }
 
 func (c *taskBillingCoordinator) SettleBilling(orderID string, providerRequestID string) error {
@@ -93,7 +101,8 @@ func (c *taskBillingCoordinator) MarkBillingUncertain(orderID string, errorText 
 // CheckRetryEligibility 收敛失败/取消任务重试前的计费状态校验。
 //
 // 计费订单读取失败不能被当作“没有待核对订单”继续放行，否则重试可能重复扣费。
-// 只有明确读到订单且订单不是 uncertain 时，才允许进入后续的重新计费流程。
+// 仍处于 reserved/running 的订单表示上一轮账务收尾未完成，也必须先核对；
+// 只有已释放、已结算或已退款等明确终态才允许进入后续的重新计费流程。
 func (c *taskBillingCoordinator) CheckRetryEligibility(orderID string) error {
 	if strings.TrimSpace(orderID) == "" {
 		return nil
@@ -105,10 +114,12 @@ func (c *taskBillingCoordinator) CheckRetryEligibility(orderID string) error {
 	if order == nil {
 		return fmt.Errorf("任务计费订单不存在：%s", orderID)
 	}
-	if order.Status == model.BillingStatusUncertain {
+	switch order.Status {
+	case model.BillingStatusUncertain, model.BillingStatusReserved, model.BillingStatusRunning:
 		return errTaskBillingReview
+	default:
+		return nil
 	}
-	return nil
 }
 
 func (c *taskBillingCoordinator) BillingFailureRequiresReview(orderID string, taskID string, err error) bool {
@@ -130,8 +141,19 @@ func billingFailureUncertain(err error) bool {
 	if err == nil {
 		return false
 	}
+	var decodeErr providerResponseDecodeError
+	if errors.As(err, &decodeErr) {
+		return true
+	}
+	var settlementErr billingSettlementError
+	if errors.As(err, &settlementErr) {
+		return true
+	}
+	if isRouteDispatchUncertain(err) {
+		return true
+	}
 	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"524", "timeout", "超时", "deadline exceeded", "context canceled", "connection reset", "unexpected eof", "broken pipe"} {
+	for _, marker := range []string{"524", "timeout", "超时", "deadline exceeded", "context canceled", "connection reset", "unexpected eof", "broken pipe", "may have been accepted", "possibly accepted", "submission unknown", "unknown upstream charge", "refreshing provider state failed", "刷新任务上游状态失败", "上游扣费未知", "提交状态未知", "上游已接受请求，但没有可恢复的任务 id", "上一次提交结果不明确", "提交状态未能独占确认"} {
 		if strings.Contains(message, marker) {
 			return true
 		}

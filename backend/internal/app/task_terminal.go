@@ -2,9 +2,12 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"yingce/backend/internal/model"
 	"yingce/backend/internal/repository"
@@ -27,10 +30,12 @@ type taskTerminalCoordinator struct {
 type taskTerminalRepository interface {
 	Task(id string) (*model.Task, error)
 	UpdateTaskTerminalDiagnostic(task *model.Task, completedAt time.Time) (bool, error)
+	UpdateTaskExecutionDiagnostic(userID, taskID, diagnosticJSON string) error
 }
 
 type taskBillingLifecycle interface {
 	MarkBillingUncertain(orderID string, errorText string) error
+	ReleaseBillingReservation(orderID string, reason string) error
 	RefundBilling(orderID string, errorText string) error
 	BillingFailureRequiresReview(orderID string, taskID string, err error) bool
 	SettleBilling(orderID string, providerRequestID string) error
@@ -84,12 +89,15 @@ func (s *Service) terminalCoordinator() *taskTerminalCoordinator {
 	return newTaskTerminalCoordinator(s)
 }
 
-func (c *taskTerminalCoordinator) markPreparationFailure(task *model.Task, stage string, err error, billingUncertain bool, refundReason string) error {
+func (c *taskTerminalCoordinator) markPreparationFailure(task *model.Task, stage string, err error, billingUncertain bool, refundReason string, platformRetry bool) error {
 	c.ensureFailedAttemptLogged(task, err)
 	task.Status = model.TaskStatusFailed
 	task.Stage = stage
 	task.Error = c.userFacingMessage(err)
 	outcome, retryClass := "not_submitted", "correct_input"
+	if platformRetry {
+		retryClass = "platform_retry"
+	}
 	if billingUncertain {
 		outcome, retryClass = "unknown", "reconcile_submission"
 	}
@@ -100,18 +108,192 @@ func (c *taskTerminalCoordinator) markPreparationFailure(task *model.Task, stage
 	var billingErr error
 	if billingUncertain {
 		billingErr = c.billing.MarkBillingUncertain(task.BillingOrderID, task.Error)
+	} else if taskIsAudio(task, nil) {
+		billingErr = c.billing.ReleaseBillingReservation(task.BillingOrderID, refundReason)
 	} else {
 		billingErr = c.billing.RefundBilling(task.BillingOrderID, refundReason)
 	}
 	if billingErr != nil {
+		// A failed release/refund must never turn into an ordinary retry. Mark the
+		// order for reconciliation when possible and persist a durable retry guard;
+		// this also protects the path where the billing transaction's final state
+		// is not known to the caller.
+		if !billingUncertain && taskIsAudio(task, nil) {
+			billingErr = errors.Join(billingErr, c.billing.MarkBillingUncertain(task.BillingOrderID, "音频预授权释放失败，费用状态待核对"))
+		}
+		billingErr = c.persistBillingCleanupFailure(task, billingErr)
 		return errors.Join(err, fmt.Errorf("任务计费收尾失败：%w", billingErr))
 	}
 	return err
 }
 
+func (c *taskTerminalCoordinator) persistBillingCleanupFailure(task *model.Task, billingErr error) error {
+	if billingErr == nil {
+		return nil
+	}
+	diagnostic := taskExecutionDiagnostic(task)
+	if diagnostic == nil {
+		diagnostic = &model.TaskExecutionDiagnostic{
+			SubmissionOutcome: "unknown",
+			DiagnosticID:      task.ID,
+		}
+	}
+	diagnostic.Phase = "billing"
+	diagnostic.Code = "billing_cleanup_failed"
+	diagnostic.RetryClass = "reconcile_submission"
+	diagnostic.SafeMessage = safeTaskDiagnosticMessage(task.Error)
+	raw, marshalErr := json.Marshal(diagnostic)
+	if marshalErr != nil {
+		return errors.Join(billingErr, marshalErr)
+	}
+	task.ExecutionDiagnosticJSON = string(raw)
+	task.Diagnostic = diagnostic
+	if diagnosticErr := c.repo.UpdateTaskExecutionDiagnostic(task.UserID, task.ID, task.ExecutionDiagnosticJSON); diagnosticErr != nil {
+		return errors.Join(billingErr, diagnosticErr)
+	}
+	return billingErr
+}
+
 // handleExecutionFailure 返回 nil 仅表示取消已被正常收尾；普通失败仍返回原始错误，
 // 让 worker 保留重试/监控所需的失败语义。
+func audioPlatformRetryAllowed(err error) bool {
+	if err == nil {
+		return false
+	}
+	var settlementErr billingSettlementError
+	if errors.As(err, &settlementErr) {
+		return false
+	}
+	phase := providerExecutionPhase(err)
+	// A local preflight failure is safe to retry only when it is not clearly
+	// caused by the user's input or channel configuration. Upload failures are
+	// handled below because their HTTP/decode evidence determines the cause.
+	if providerRequestNotStarted(err) && phase == "" {
+		message := strings.ToLower(err.Error())
+		if providerErrorLooksUserCaused(message) {
+			return false
+		}
+		return true
+	}
+	if billingFailureUncertain(err) && phase != "upload" {
+		return false
+	}
+	var circuitErr providerCircuitOpenError
+	if errors.As(err, &circuitErr) {
+		return true
+	}
+	var decodeErr providerResponseDecodeError
+	if errors.As(err, &decodeErr) {
+		// Upload decoding happens before billable create and therefore cannot
+		// leave an audio generation charge uncertain. Create decoding remains
+		// conservative because the provider may already have accepted the job.
+		return phase == "upload"
+	}
+	var payloadErr providerPayloadError
+	if errors.As(err, &payloadErr) {
+		raw := strings.ToLower(payloadErr.raw)
+		// An explicit outage marker is authoritative even when the provider
+		// mentions an authentication or quota subsystem in the same payload.
+		if providerErrorLooksExplicitPlatformFailure(raw) {
+			return true
+		}
+		if providerErrorLooksUserCaused(raw) {
+			return false
+		}
+		return providerErrorLooksPlatformFailure(raw)
+	}
+	var httpErr providerHTTPError
+	if errors.As(err, &httpErr) {
+		body := strings.ToLower(httpErr.Body)
+		// 400, 422, and Cloudflare 524 are user/error-boundary outcomes for
+		// retry authorization even when the response body contains outage words.
+		if httpErr.StatusCode == 400 || httpErr.StatusCode == 422 || httpErr.StatusCode == 524 {
+			return false
+		}
+		if providerErrorLooksExplicitPlatformFailure(body) {
+			return true
+		}
+		if providerErrorLooksUserCaused(body) {
+			return false
+		}
+		return providerHTTPStatusAllowsPlatformRetry(httpErr.StatusCode)
+	}
+	message := strings.ToLower(err.Error())
+	if providerErrorLooksExplicitPlatformFailure(message) {
+		return true
+	}
+	if providerErrorLooksUserCaused(message) {
+		return false
+	}
+	return providerErrorLooksPlatformFailure(message)
+}
+
+func providerHTTPStatusAllowsPlatformRetry(statusCode int) bool {
+	switch statusCode {
+	case 408, 429, 500, 501, 502, 503, 504, 505, 507, 508, 520, 521, 522, 523, 525, 526, 529:
+		return true
+	default:
+		return false
+	}
+}
+
+func providerErrorLooksUserCaused(message string) bool {
+	if isContentModerationFailure(message) {
+		return true
+	}
+	for _, marker := range []string{
+		"invalid parameter", "invalid_argument", "invalid argument", "invalid input", "invalid request", "invalid prompt", "invalid model", "invalid api key", "invalid_api_key", "invalid credentials", "parameter", "argument", "bad request", "user input", "authentication", "unauthorized", "forbidden", "permission", "access denied", "api key", "quota", "insufficient", "balance", "billing", "model not found", "model does not exist", "not found", "不存在", "权限", "鉴权", "额度", "配额", "余额", "参数错误", "参数无效", "参数不合法", "输入错误", "输入无效",
+	} {
+		if providerErrorContainsMarker(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerErrorContainsMarker(message string, marker string) bool {
+	if strings.ContainsAny(marker, " _-") {
+		return strings.Contains(message, marker)
+	}
+	for _, token := range strings.FieldsFunc(message, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if token == marker {
+			return true
+		}
+	}
+	return false
+}
+
+func providerErrorLooksExplicitPlatformFailure(message string) bool {
+	message = strings.ToLower(message)
+	for _, marker := range []string{
+		"authentication service unavailable", "authentication temporarily unavailable",
+		"authorization service unavailable", "authorization temporarily unavailable",
+		"quota service unavailable", "quota temporarily unavailable",
+		"parameter service unavailable", "parameter temporarily unavailable",
+		"invalid upstream response", "malformed upstream response", "unexpected upstream response", "load balancer unavailable", "上游素材上传没有返回素材 id",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func providerErrorLooksPlatformFailure(message string) bool {
+	for _, marker := range []string{
+		"internal server error", "service unavailable", "temporarily unavailable", "temporary failure", "server overloaded", "overloaded", "upstream error", "gateway error", "bad gateway", "connection refused", "connection failed", "network unreachable", "dns", "dial tcp", "系统繁忙", "服务暂时不可用", "服务不可用",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *taskTerminalCoordinator) handleExecutionFailure(task *model.Task, err error, providerSucceeded bool, channelSlotFailedBeforeRequest bool) error {
+	requestNotStarted := channelSlotFailedBeforeRequest || providerRequestDefinitelyNotSubmitted(err)
 	if errors.Is(err, context.Canceled) {
 		// 用户取消会先把数据库任务置为 cancelled，再停止 worker context。
 		// 此时不再重复退款/核对，只补齐 worker 侧的回放和日志收尾。
@@ -123,13 +305,18 @@ func (c *taskTerminalCoordinator) handleExecutionFailure(task *model.Task, err e
 		task.Error = "任务已取消"
 		now := time.Now()
 		task.CancellationSource, task.CancellationRequestedAt = model.TaskCancellationWorkerContext, &now
-		recordTaskDiagnostic(task, "cancellation", "task_cancelled", taskSubmissionOutcome(task, channelSlotFailedBeforeRequest), "reconcile_cancellation", err)
+		recordTaskDiagnostic(task, "cancellation", "task_cancelled", taskSubmissionOutcome(task, requestNotStarted), "reconcile_cancellation", err)
 		if terminalErr := c.markTerminalState(task); terminalErr != nil {
 			return terminalErr
 		}
 		var billingErr error
-		if channelSlotFailedBeforeRequest {
-			billingErr = c.billing.RefundBilling(task.BillingOrderID, "等待渠道槽位期间取消，上游请求未发出")
+		var settlementErr billingSettlementError
+		if errors.As(err, &settlementErr) {
+			billingErr = c.billing.MarkBillingUncertain(task.BillingOrderID, "任务取消时音频结算状态不明确")
+		} else if requestNotStarted && taskIsAudio(task, nil) {
+			billingErr = c.billing.ReleaseBillingReservation(task.BillingOrderID, "上游请求未发出，任务取消")
+		} else if requestNotStarted {
+			billingErr = c.billing.RefundBilling(task.BillingOrderID, "上游请求未发出，任务取消")
 		} else {
 			billingErr = c.billing.MarkBillingUncertain(task.BillingOrderID, "任务取消时上游费用状态不明确")
 		}
@@ -137,6 +324,10 @@ func (c *taskTerminalCoordinator) handleExecutionFailure(task *model.Task, err e
 		_ = c.logger.log(task.UserID, task.ID, "warn", "任务已取消", "")
 		var resultErr error
 		if billingErr != nil {
+			if requestNotStarted && taskIsAudio(task, nil) {
+				billingErr = errors.Join(billingErr, c.billing.MarkBillingUncertain(task.BillingOrderID, "取消时音频预授权释放失败，费用状态待核对"))
+			}
+			billingErr = c.persistBillingCleanupFailure(task, billingErr)
 			resultErr = errors.Join(resultErr, fmt.Errorf("任务取消后的计费收尾失败：%w", billingErr))
 		}
 		return resultErr
@@ -146,12 +337,17 @@ func (c *taskTerminalCoordinator) handleExecutionFailure(task *model.Task, err e
 	c.ensureFailedAttemptLogged(task, err)
 	task.Stage = "任务失败"
 	task.Error = c.userFacingMessage(err)
-	outcome := taskSubmissionOutcome(task, channelSlotFailedBeforeRequest)
+	outcome := taskSubmissionOutcome(task, requestNotStarted)
 	if providerSucceeded {
 		outcome = "accepted"
 	}
+	var settlementErr billingSettlementError
+	requiresReview := providerSucceeded || errors.As(err, &settlementErr) || (!requestNotStarted && c.billing.BillingFailureRequiresReview(task.BillingOrderID, task.ID, err))
+	platformRetry := taskIsAudio(task, nil) && !requiresReview && audioPlatformRetryAllowed(err)
 	retryClass := "new_generation_authorization"
-	if outcome == "unknown" {
+	if platformRetry {
+		retryClass = "platform_retry"
+	} else if requiresReview || outcome == "unknown" {
 		retryClass = "reconcile_submission"
 	}
 	recordTaskDiagnostic(task, "execution", "provider_execution_failed", outcome, retryClass, err)
@@ -160,14 +356,24 @@ func (c *taskTerminalCoordinator) handleExecutionFailure(task *model.Task, err e
 	}
 	c.finalizeReplay(task, model.TaskStatusFailed, "文本回放草稿归并失败")
 	var billingErr error
-	if providerSucceeded || (!channelSlotFailedBeforeRequest && c.billing.BillingFailureRequiresReview(task.BillingOrderID, task.ID, err)) {
+	if requiresReview {
 		billingErr = c.billing.MarkBillingUncertain(task.BillingOrderID, task.Error)
+	} else if taskIsAudio(task, nil) {
+		if requestNotStarted {
+			billingErr = c.billing.ReleaseBillingReservation(task.BillingOrderID, "上游请求未发出，音频未开始执行")
+		} else {
+			billingErr = c.billing.SettleBilling(task.BillingOrderID, task.ProviderRequestID)
+		}
 	} else {
 		billingErr = c.billing.RefundBilling(task.BillingOrderID, task.Error)
 	}
 	_ = c.logger.log(task.UserID, task.ID, "error", "任务处理失败", task.Error)
 	resultErr := err
 	if billingErr != nil {
+		if !requiresReview && taskIsAudio(task, nil) {
+			billingErr = errors.Join(billingErr, c.billing.MarkBillingUncertain(task.BillingOrderID, "音频计费收尾失败，费用状态待核对"))
+		}
+		billingErr = c.persistBillingCleanupFailure(task, billingErr)
 		resultErr = errors.Join(resultErr, fmt.Errorf("任务计费收尾失败：%w", billingErr))
 	}
 	return resultErr
@@ -254,33 +460,12 @@ func (c *taskTerminalCoordinator) handleSuccessWithSettlement(task *model.Task, 
 				return err
 			}
 		}
-		if audioBilling, ok := c.billing.(audioDurationTaskBilling); ok && capabilityFromTaskType(task.Type) == "audio" {
-			orderReader, readerOK := c.billing.(billingOrderReader)
-			if readerOK {
-				order, err := orderReader.BillingOrder(task.BillingOrderID)
-				if err != nil {
-					return err
-				}
-				// Only audio orders priced per second need measured output duration.
-				// Fixed-request audio must retain the ordinary settlement path even
-				// when the stored resource has no duration metadata.
-				if order == nil || order.Capability != "audio" || order.BillingMode != "per_second" {
-					return c.billing.SettleBilling(task.BillingOrderID, "")
-				}
-			}
-			output, outputOK := c.outputs.(audioDurationTaskOutput)
-			if outputOK {
-				if completedTask == nil {
-					return errors.New("任务成功后无法读取音频产物")
-				}
-				durationMs, err := output.AudioOutputDurationMs(*completedTask)
-				if err != nil {
-					return err
-				}
-				return audioBilling.SettleBillingWithAudioDuration(task.BillingOrderID, "", durationMs)
-			}
+
+		providerRequestID := task.ProviderRequestID
+		if completedTask != nil && completedTask.ProviderRequestID != "" {
+			providerRequestID = completedTask.ProviderRequestID
 		}
-		return c.billing.SettleBilling(task.BillingOrderID, "")
+		return c.billing.SettleBilling(task.BillingOrderID, providerRequestID)
 	}
 	if settle != nil {
 		settleBilling = settle

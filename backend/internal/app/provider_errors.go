@@ -53,6 +53,67 @@ func (providerCircuitOpenError) Error() string {
 	return "当前渠道连续失败，已暂时熔断，请稍后重试"
 }
 
+// providerRequestNotStartedError 表示出站请求在 client.Do 前就被本地策略、
+// 渠道调度或请求构造阻止。音频订单在这种情况下只能释放预留，不能记作已消费。
+type providerRequestNotStartedError struct {
+	Err error
+}
+
+func (e providerRequestNotStartedError) Error() string { return e.Err.Error() }
+
+func (e providerRequestNotStartedError) Unwrap() error { return e.Err }
+
+func providerRequestNotStarted(err error) bool {
+	var notStarted providerRequestNotStartedError
+	return errors.As(err, &notStarted)
+}
+
+// providerExecutionPhaseError preserves where a declarative protocol failed.
+// An upload or request-building failure proves that the billable create stage
+// was never reached; a create failure may already have crossed client.Do.
+type providerExecutionPhaseError struct {
+	Phase string
+	Err   error
+}
+
+func (e providerExecutionPhaseError) Error() string {
+	if e.Err == nil {
+		return e.Phase
+	}
+	return fmt.Sprintf("声明式协议%s阶段失败：%v", e.Phase, e.Err)
+}
+
+func (e providerExecutionPhaseError) Unwrap() error { return e.Err }
+
+func providerExecutionPhase(err error) string {
+	var phaseErr providerExecutionPhaseError
+	if errors.As(err, &phaseErr) {
+		return strings.TrimSpace(strings.ToLower(phaseErr.Phase))
+	}
+	return ""
+}
+
+// providerRequestDefinitelyNotSubmitted is intentionally narrower than
+// providerRequestNotStarted: only pre-create protocol phases prove that the
+// billable generation request was not sent. A create-stage transport error can
+// happen after the provider accepted the request and must remain uncertain.
+func providerRequestDefinitelyNotSubmitted(err error) bool {
+	phase := providerExecutionPhase(err)
+	return phase == "upload" || phase == "preparation" || providerRequestNotStarted(err)
+}
+
+// billingSettlementError 表示已进入扣费边界，但结算结果无法安全确认。
+// 这类错误必须进入账务核对，不能释放预留或触发免费重试。
+type billingSettlementError struct {
+	Err error
+}
+
+func (e billingSettlementError) Error() string {
+	return fmt.Sprintf("音频计费结算失败：%v", e.Err)
+}
+
+func (e billingSettlementError) Unwrap() error { return e.Err }
+
 type providerStatePendingError struct {
 	TaskID string
 	Cause  error

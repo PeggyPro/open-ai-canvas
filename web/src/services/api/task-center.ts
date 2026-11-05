@@ -7,7 +7,7 @@ import { getActiveUserScope } from "@/lib/user-scope";
 export type { BackendEnvelope } from "@/services/api/request";
 
 export type TaskStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
-export type TaskBillingStatus = "reserved" | "running" | "settled" | "refunded" | "uncertain";
+export type TaskBillingStatus = "reserved" | "running" | "settled" | "refunded" | "released" | "uncertain";
 export type ProviderCancelStatus = "requested" | "confirmed" | "uncertain";
 export type GenerationTaskResultState = "NOT_AVAILABLE" | "PENDING_MATERIALIZATION" | "MATERIALIZING" | "READY" | "FAILED_RETRYABLE" | "FAILED_PERMANENT";
 export type GenerationTaskOutput = {

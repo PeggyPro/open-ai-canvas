@@ -10,6 +10,7 @@ import (
 
 type taskBillingRepositoryStub struct {
 	runningCalls      []string
+	releaseCalls      []string
 	settleCalls       []string
 	restoreCalls      []string
 	refundCalls       []string
@@ -18,6 +19,7 @@ type taskBillingRepositoryStub struct {
 	orderErr          error
 	hasSuccessfulCall bool
 	callErr           error
+	settleErr         error
 }
 
 func (r *taskBillingRepositoryStub) MarkBillingRunning(orderID string) error {
@@ -25,9 +27,14 @@ func (r *taskBillingRepositoryStub) MarkBillingRunning(orderID string) error {
 	return nil
 }
 
+func (r *taskBillingRepositoryStub) ReleaseBillingReservation(orderID string, reason string) error {
+	r.releaseCalls = append(r.releaseCalls, orderID+":"+reason)
+	return nil
+}
+
 func (r *taskBillingRepositoryStub) SettleBillingOrder(orderID string, providerRequestID string) error {
 	r.settleCalls = append(r.settleCalls, orderID+":"+providerRequestID)
-	return nil
+	return r.settleErr
 }
 
 func (r *taskBillingRepositoryStub) RestoreRefundedBillingOrder(orderID string, providerRequestID string) error {
@@ -63,6 +70,9 @@ func TestTaskBillingCoordinatorEmptyOrderIsNoOp(t *testing.T) {
 	if err := billing.SettleBilling("", "provider-1"); err != nil {
 		t.Fatalf("SettleBilling() error = %v", err)
 	}
+	if err := billing.ReleaseBillingReservation("", "pre-execution"); err != nil {
+		t.Fatalf("ReleaseBillingReservation() error = %v", err)
+	}
 	if err := billing.RestoreRefundedBilling("", "provider-1"); err != nil {
 		t.Fatalf("RestoreRefundedBilling() error = %v", err)
 	}
@@ -75,7 +85,7 @@ func TestTaskBillingCoordinatorEmptyOrderIsNoOp(t *testing.T) {
 	if billing.BillingFailureRequiresReview("", "task-1", errors.New("timeout")) {
 		t.Fatal("BillingFailureRequiresReview() = true for empty order")
 	}
-	if len(repo.runningCalls)+len(repo.settleCalls)+len(repo.restoreCalls)+len(repo.refundCalls)+len(repo.uncertainCalls) != 0 {
+	if len(repo.runningCalls)+len(repo.releaseCalls)+len(repo.settleCalls)+len(repo.restoreCalls)+len(repo.refundCalls)+len(repo.uncertainCalls) != 0 {
 		t.Fatalf("empty order should not reach repository: %#v", repo)
 	}
 }
@@ -90,8 +100,10 @@ func TestTaskBillingCoordinatorRetryEligibility(t *testing.T) {
 		wantReview bool
 	}{
 		{name: "empty order", wantErr: false},
-		{name: "running order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusRunning}, wantErr: false},
+		{name: "reserved order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusReserved}, wantErr: true, wantReview: true},
+		{name: "running order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusRunning}, wantErr: true, wantReview: true},
 		{name: "settled order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusSettled}, wantErr: false},
+		{name: "released order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusReleased}, wantErr: false},
 		{name: "refunded order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusRefunded}, wantErr: false},
 		{name: "uncertain order", orderID: "order-1", order: &model.BillingOrder{Status: model.BillingStatusUncertain}, wantErr: true, wantReview: true},
 		{name: "missing order", orderID: "order-1", wantErr: true, wantReview: false},

@@ -1,7 +1,6 @@
 import { http } from "@/services/api/request";
 import type { ModelTag } from "@/lib/model-tags";
 
-
 export type CreditAccount = {
     userId: string;
     availableMicrocredits: number;
@@ -241,7 +240,7 @@ export type BillingOrder = {
     usageAvailable: boolean;
     videoFormulaTokens?: number;
     usageSource?: "provider" | "video_formula";
-    status: "reserved" | "running" | "settled" | "refunded" | "uncertain";
+    status: "reserved" | "running" | "settled" | "refunded" | "released" | "uncertain";
     providerRequestId?: string;
     error?: string;
     resolvedBy?: string;

@@ -32,6 +32,38 @@ func (r *Repository) TaskForUser(userID string, id string) (*model.Task, error) 
 	return &task, nil
 }
 
+func audioTaskHasDefinitePreSubmitFailure(task model.Task) bool {
+	if task.Status != model.TaskStatusFailed && task.Status != model.TaskStatusCancelled {
+		return false
+	}
+	// A successful retry may retain an earlier retry diagnostic. A persisted
+	// provider request ID is durable evidence that this task has reached the
+	// upstream, regardless of what an older diagnostic says.
+	if strings.TrimSpace(task.ProviderRequestID) != "" {
+		return false
+	}
+	raw := strings.TrimSpace(task.ExecutionDiagnosticJSON)
+	if raw == "" {
+		return false
+	}
+	var diagnostic model.TaskExecutionDiagnostic
+	if json.Unmarshal([]byte(raw), &diagnostic) != nil {
+		return false
+	}
+	if diagnostic.TaskSubmitted || diagnostic.SubmissionOutcome != "not_submitted" {
+		return false
+	}
+	// A billing cleanup failure can retain the original not_submitted outcome
+	// while the reservation state is still unresolved. Preserve that order for
+	// reconciliation instead of treating the outcome alone as release proof.
+	switch diagnostic.RetryClass {
+	case "correct_input", "new_generation_authorization", "platform_retry", "reconcile_cancellation":
+		return diagnostic.Phase == "preparation" || diagnostic.Phase == "execution" || diagnostic.Phase == "cancellation"
+	default:
+		return false
+	}
+}
+
 // DeleteTerminalTask removes a task's history after it has reached a terminal state.
 // The conditional task delete is performed first in the same transaction as the
 // cleanup. This makes a late worker write lose the race instead of recreating or
@@ -45,6 +77,42 @@ func (r *Repository) DeleteTerminalTask(userID string, taskID string) error {
 
 	return r.Transaction(func(repo *Repository) error {
 		tx := repo.db
+		var task model.Task
+		if err := tx.Select("id", "status", "type", "workbench_kind", "input_json", "billing_order_id", "provider_request_id", "execution_diagnostic_json").First(&task, "id = ? AND user_id = ?", taskID, userID).Error; err != nil {
+			return err
+		}
+		if task.Status == model.TaskStatusQueued || task.Status == model.TaskStatusRunning {
+			return ErrTaskStateConflict
+		}
+		isAudioTask := strings.EqualFold(strings.TrimSpace(task.WorkbenchKind), model.WorkbenchKindAudio) ||
+			strings.Contains(strings.ToLower(task.Type), "audio") ||
+			audioTaskInputJSON(task.InputJSON)
+
+		// A terminal audio task can still retain a reservation when a pre-request
+		// cleanup failed. Release only that definitely-unstarted state before
+		// deleting the task; running/uncertain orders remain protected from any
+		// automatic credit return.
+		if isAudioTask && audioTaskHasDefinitePreSubmitFailure(task) {
+			var reservedOrder model.BillingOrder
+			orderQuery := tx.Where("user_id = ? AND status = ?", userID, model.BillingStatusReserved)
+			var orderErr error
+			if strings.TrimSpace(task.BillingOrderID) != "" {
+				// Keep an inconsistent or stale task pointer from releasing another
+				// task's reservation. Empty task_id is retained for legacy orders
+				// that are linked only through the task's billing_order_id.
+				orderErr = orderQuery.Where("id = ? AND (task_id = ? OR task_id = '')", task.BillingOrderID, taskID).First(&reservedOrder).Error
+			} else {
+				orderErr = orderQuery.Where("task_id = ?", taskID).First(&reservedOrder).Error
+			}
+			if orderErr == nil {
+				if err := releaseBillingReservationTx(tx, reservedOrder.ID, "终态音频任务删除前释放未开始的预留", []model.BillingStatus{model.BillingStatusReserved}); err != nil {
+					return err
+				}
+			} else if !errors.Is(orderErr, gorm.ErrRecordNotFound) {
+				return orderErr
+			}
+		}
+
 		deleted := tx.Where(
 			"id = ? AND user_id = ? AND status NOT IN ?",
 			taskID, userID, []model.TaskStatus{model.TaskStatusQueued, model.TaskStatusRunning},
@@ -53,14 +121,21 @@ func (r *Repository) DeleteTerminalTask(userID string, taskID string) error {
 			return deleted.Error
 		}
 		if deleted.RowsAffected != 1 {
-			var task model.Task
-			if err := tx.Select("id", "status").First(&task, "id = ? AND user_id = ?", taskID, userID).Error; err != nil {
-				return err
-			}
 			// A terminal row can disappear between the conditional DELETE and this
 			// read when another delete wins the race. Report the same conflict so
 			// callers never mistake a state race for a successful deletion.
 			return ErrTaskStateConflict
+		}
+
+		// Detached legacy orders lose the task metadata used to identify audio.
+		// Persist the immutable capability marker before detaching them so a later
+		// refund or recovery path cannot return consumed audio credits.
+		if isAudioTask {
+			if err := tx.Model(&model.BillingOrder{}).
+				Where("user_id = ? AND task_id = ?", userID, taskID).
+				Updates(map[string]any{"capability": model.WorkbenchKindAudio, "updated_at": time.Now()}).Error; err != nil {
+				return err
+			}
 		}
 
 		// These rows are task history and have no meaning after the task itself is

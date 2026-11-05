@@ -6,6 +6,7 @@
 package repository
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -98,13 +99,19 @@ func (r *Repository) BillingOrdersByTaskIDs(userID string, taskIDs []string) (ma
 		return result, nil
 	}
 	var orders []model.BillingOrder
-	if err := r.db.Where("user_id = ? AND task_id IN ?", userID, taskIDs).Find(&orders).Error; err != nil {
+	if err := r.db.Where("user_id = ? AND task_id IN ?", userID, taskIDs).Order("created_at DESC, id DESC").Find(&orders).Error; err != nil {
 		return nil, err
 	}
 	for _, order := range orders {
-		if order.TaskID != "" {
-			result[order.TaskID] = order
+		if order.TaskID == "" {
+			continue
 		}
+		// Results are ordered newest first. Keep the first row so a legacy
+		// order can never overwrite the current billing state for the task.
+		if _, exists := result[order.TaskID]; exists {
+			continue
+		}
+		result[order.TaskID] = order
 	}
 	return result, nil
 }
@@ -122,6 +129,12 @@ func (r *Repository) AutoRefundableBillingOrders(limit int) ([]model.BillingOrde
 			[]model.TaskStatus{model.TaskStatusFailed, model.TaskStatusCancelled},
 		).
 		Where("tasks.id IS NULL OR (COALESCE(tasks.media_recovery_json, '') = '' AND COALESCE(tasks.execution_diagnostic_json, '') NOT LIKE ?)", `%"code":"result_persistence_failed"%`).
+		Where("tasks.id IS NULL OR (COALESCE(tasks.workbench_kind, '') <> ? AND LOWER(COALESCE(tasks.type, '')) NOT LIKE ? AND LOWER(REPLACE(COALESCE(tasks.input_json, ''), ' ', '')) NOT LIKE ? AND LOWER(REPLACE(COALESCE(tasks.input_json, ''), ' ', '')) NOT LIKE ?)", model.WorkbenchKindAudio, "%audio%", `%"mode":"audio"%`, `%"workbenchkind":"audio"%`).
+		// A detached legacy order with no capability and no task cannot be
+		// classified as non-audio. Treat NULL, empty, and whitespace-only
+		// capabilities as unknown so an old audio order cannot be returned merely
+		// because its task was deleted.
+		Where("(NULLIF(TRIM(billing_orders.capability), '') IS NOT NULL AND LOWER(TRIM(billing_orders.capability)) <> ?) OR (NULLIF(TRIM(billing_orders.capability), '') IS NULL AND tasks.id IS NOT NULL)", strings.ToLower(model.WorkbenchKindAudio)).
 		Select("billing_orders.*").Order("billing_orders.created_at desc").Limit(limit).Find(&items).Error
 	return items, err
 }
@@ -234,7 +247,10 @@ func (r *Repository) MarkBillingRunning(id string) error {
 	if err := r.db.Select("id", "status").First(&order, "id = ?", id).Error; err != nil {
 		return err
 	}
-	if order.Status == model.BillingStatusRunning {
+	if order.Status == model.BillingStatusRunning || order.Status == model.BillingStatusSettled {
+		// Reclaimed detached polling tasks can already have consumed the quoted
+		// audio order before the worker lease was lost. Treat both states as
+		// idempotent so recovery never attempts to reopen a settled order.
 		return nil
 	}
 	now := time.Now()
@@ -257,6 +273,112 @@ func (r *Repository) MarkBillingUncertain(id string, errorText string) error {
 		Updates(map[string]any{"status": model.BillingStatusUncertain, "error": errorText, "updated_at": time.Now()}).Error
 }
 
+// ReleaseBillingReservation returns a pre-execution audio reservation to the
+// user's available balance. It is intentionally distinct from a refund: the
+// order is terminally released and cannot be restored as a consumed call.
+func (r *Repository) ReleaseBillingReservation(id string, reason string) error {
+	if id == "" {
+		return nil
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		return releaseBillingReservationTx(tx, id, reason, []model.BillingStatus{model.BillingStatusReserved, model.BillingStatusRunning})
+	})
+}
+
+func billingStatusIn(status model.BillingStatus, allowed []model.BillingStatus) bool {
+	for _, candidate := range allowed {
+		if status == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func releaseBillingReservationTx(tx *gorm.DB, id string, reason string, allowedStatuses []model.BillingStatus) error {
+	var order model.BillingOrder
+	if err := tx.First(&order, "id = ?", id).Error; err != nil {
+		return err
+	}
+	isAudio, err := billingOrderIsAudio(tx, order)
+	if err != nil {
+		return err
+	}
+	if !isAudio {
+		return errors.New("only audio billing reservations can be released")
+	}
+	if order.Status == model.BillingStatusReleased {
+		return nil
+	}
+	if !billingStatusIn(order.Status, allowedStatuses) {
+		return ErrBillingStateConflict
+	}
+	amount := order.AmountMicrocredits
+	if amount <= 0 {
+		return errors.New("invalid reserved billing amount")
+	}
+	now := time.Now()
+	// Claim the terminal transition before touching the account. The
+	// conditional update serializes concurrent release attempts on the same
+	// order; only the caller that changes reserved/running to released may
+	// return the reservation or write its ledger entry.
+	claimed := tx.Model(&model.BillingOrder{}).
+		Where("id = ? AND status IN ?", id, allowedStatuses).
+		Updates(map[string]any{
+			"status":                       model.BillingStatusReleased,
+			"error":                        reason,
+			"actual_amount_microcredits":   0,
+			"refunded_amount_microcredits": 0,
+			"refunded_at":                  nil,
+			"updated_at":                   now,
+		})
+	if claimed.Error != nil {
+		return claimed.Error
+	}
+	if claimed.RowsAffected != 1 {
+		var current model.BillingOrder
+		if err := tx.Select("status").First(&current, "id = ?", id).Error; err != nil {
+			return err
+		}
+		if current.Status == model.BillingStatusReleased {
+			return nil
+		}
+		return ErrBillingStateConflict
+	}
+	updated := tx.Model(&model.CreditAccount{}).
+		Where("user_id = ? AND reserved_microcredits >= ?", order.UserID, amount).
+		Updates(map[string]any{
+			"available_microcredits": gorm.Expr("available_microcredits + ?", amount),
+			"reserved_microcredits":  gorm.Expr("reserved_microcredits - ?", amount),
+			"version":                gorm.Expr("version + 1"),
+			"updated_at":             time.Now(),
+		})
+	if updated.Error != nil {
+		return updated.Error
+	}
+	if updated.RowsAffected != 1 {
+		return errors.New("reserved credit balance is inconsistent")
+	}
+	var account model.CreditAccount
+	if err := tx.First(&account, "user_id = ?", order.UserID).Error; err != nil {
+		return err
+	}
+	return tx.Create(&model.CreditLedgerEntry{
+		ID:                         newRepositoryID(),
+		UserID:                     order.UserID,
+		Type:                       model.CreditLedgerRelease,
+		AmountMicrocredits:         amount,
+		AvailableDeltaMicrocredits: amount,
+		ReservedDeltaMicrocredits:  -amount,
+		AvailableAfterMicrocredits: account.AvailableMicrocredits,
+		ReservedAfterMicrocredits:  account.ReservedMicrocredits,
+		BillingOrderID:             order.ID,
+		Model:                      order.Model,
+		ChannelID:                  order.ChannelID,
+		Scene:                      order.Scene,
+		Note:                       reason,
+	}).Error
+}
+
 func (r *Repository) SettleBillingOrder(id string, providerRequestID string) error {
 	return r.settleBillingOrder(id, providerRequestID, nil)
 }
@@ -276,10 +398,18 @@ func (r *Repository) settleBillingOrder(id string, providerRequestID string, aud
 			return err
 		}
 		if order.Status == model.BillingStatusSettled {
+			if strings.TrimSpace(providerRequestID) != "" && strings.TrimSpace(order.ProviderRequestID) == "" {
+				if err := tx.Model(&order).Updates(map[string]any{"provider_request_id": providerRequestID, "updated_at": time.Now()}).Error; err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		if order.Status == model.BillingStatusRefunded {
 			return errors.New("billing order already refunded")
+		}
+		if order.Status == model.BillingStatusReleased {
+			return ErrBillingStateConflict
 		}
 		if order.BillingMode != "token" {
 			if err := validateBillingChargeLimit(order, order.AmountMicrocredits); err != nil {
@@ -366,9 +496,9 @@ func (r *Repository) settleBillingOrder(id string, providerRequestID string, aud
 		quantity := order.Quantity
 		refund := int64(0)
 		supplement := int64(0)
-		// 音频始终按实测时长结算；视频处理任务（画质增强等）由调用方显式传入输出时长，
-		// 普通视频生成仍传 nil，保持按请求时长一次扣定。
-		if order.BillingMode == "per_second" && (order.Capability == "audio" || (order.Capability == "video" && audioDurationMs != nil)) {
+		// 视频处理任务（画质增强等）由调用方显式传入输出时长；
+		// 普通视频生成和音频生成均按创建时的报价一次扣定。
+		if order.BillingMode == "per_second" && order.Capability == "video" && audioDurationMs != nil {
 			mediaLabel := "音频"
 			if order.Capability == "video" {
 				mediaLabel = "视频"
@@ -531,6 +661,13 @@ func (r *Repository) RestoreRefundedBillingOrder(id string, providerRequestID st
 		if err := tx.First(&order, "id = ?", id).Error; err != nil {
 			return err
 		}
+		isAudio, err := billingOrderIsAudio(tx, order)
+		if err != nil {
+			return err
+		}
+		if isAudio {
+			return errors.New("audio billing orders cannot be restored")
+		}
 		if order.Status == model.BillingStatusSettled {
 			return nil
 		}
@@ -648,11 +785,55 @@ func zeroPricedTokenOrder(order model.BillingOrder) bool {
 		order.CachedTokenPriceMicrocredits == 0
 }
 
+// audioTaskInputJSON keeps the no-refund rule safe for older tasks that only
+// persisted the generation mode in InputJSON.
+func audioTaskInputJSON(inputJSON string) bool {
+	var input struct {
+		Mode     string `json:"mode"`
+		Metadata struct {
+			WorkbenchKind string `json:"workbenchKind"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal([]byte(inputJSON), &input) != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(input.Mode), model.WorkbenchKindAudio) ||
+		strings.EqualFold(strings.TrimSpace(input.Metadata.WorkbenchKind), model.WorkbenchKindAudio)
+}
+
+// billingOrderIsAudio keeps the no-refund rule safe for older orders whose
+// capability snapshot is empty but whose task still identifies an audio run.
+func billingOrderIsAudio(tx *gorm.DB, order model.BillingOrder) (bool, error) {
+	if strings.EqualFold(strings.TrimSpace(order.Capability), model.WorkbenchKindAudio) {
+		return true, nil
+	}
+	if strings.TrimSpace(order.TaskID) == "" {
+		return false, nil
+	}
+	var task model.Task
+	if err := tx.Select("type", "workbench_kind", "input_json").First(&task, "id = ?", order.TaskID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(task.WorkbenchKind), model.WorkbenchKindAudio) ||
+		strings.Contains(strings.ToLower(task.Type), "audio") ||
+		audioTaskInputJSON(task.InputJSON), nil
+}
+
 func (r *Repository) RefundBillingOrder(id string, errorText string) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var order model.BillingOrder
 		if err := tx.First(&order, "id = ?", id).Error; err != nil {
 			return err
+		}
+		isAudio, err := billingOrderIsAudio(tx, order)
+		if err != nil {
+			return err
+		}
+		if isAudio {
+			return errors.New("audio billing orders cannot be refunded")
 		}
 		if order.Status == model.BillingStatusRefunded {
 			return nil

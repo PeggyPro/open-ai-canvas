@@ -7,6 +7,10 @@ describe("backend API request error semantics", () => {
         await expect(request(Promise.resolve({ data: { code: 0, data: { id: "task-1" }, msg: "ok" }, status: 200 }))).resolves.toEqual({ id: "task-1" });
     });
 
+    test("accepts an empty 204 success response", async () => {
+        await expect(request(Promise.resolve({ data: undefined as never, status: 204 }))).resolves.toBeUndefined();
+    });
+
     test("preserves business code and reason from a non-zero envelope", async () => {
         const thrown = await request(Promise.resolve({ data: { code: 40901, data: null, msg: "任务状态已变化", reason: "conflict" }, status: 200 })).catch((error) => error);
 
@@ -87,10 +91,12 @@ describe("backend API request error semantics", () => {
     });
 
     test("quota exceeded is not retryable", async () => {
-        const thrown = await request(Promise.resolve({
-            data: { code: 40301, data: null, msg: "账号素材数量已达到 100 个上限", reason: "quota_exceeded" },
-            status: 403,
-        })).catch((error) => error);
+        const thrown = await request(
+            Promise.resolve({
+                data: { code: 40301, data: null, msg: "账号素材数量已达到 100 个上限", reason: "quota_exceeded" },
+                status: 403,
+            }),
+        ).catch((error) => error);
 
         expect(thrown).toBeInstanceOf(ApiError);
         expect(thrown).toMatchObject({ status: 403, code: 40301, reason: "quota_exceeded", retryable: false });
@@ -105,15 +111,17 @@ describe("backend API request error semantics", () => {
 
 describe("backend API list query params", () => {
     test("serializes pagination filters as camelCase pageSize keys", () => {
-        const query = serializeApiParams(compactApiParams({
-            page: 2,
-            pageSize: 40,
-            projectId: "project-1",
-            folderId: "folder-1",
-            mediaType: "image",
-            unitId: "unit-1",
-            q: "夜戏",
-        }));
+        const query = serializeApiParams(
+            compactApiParams({
+                page: 2,
+                pageSize: 40,
+                projectId: "project-1",
+                folderId: "folder-1",
+                mediaType: "image",
+                unitId: "unit-1",
+                q: "夜戏",
+            }),
+        );
 
         expect(query.get("page")).toBe("2");
         expect(query.get("pageSize")).toBe("40");

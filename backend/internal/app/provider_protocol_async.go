@@ -54,14 +54,14 @@ func uploadProtocolMedia(ctx context.Context, input canvasGenerationInput, adapt
 			if !done {
 				spec, err := uploader.BuildUpload(ctx, protocol.RequestContext{BaseURL: input.Config.BaseURL, Request: *request}, *item)
 				if err != nil {
-					return err
+					return providerExecutionPhaseError{Phase: "upload", Err: err}
 				}
 				body, err := executeProtocolRequest(withProviderRequestKind(ctx, "upload"), input.Config, spec)
 				if err != nil {
-					return fmt.Errorf("上传参考素材失败：%w", err)
+					return providerExecutionPhaseError{Phase: "upload", Err: fmt.Errorf("上传参考素材失败：%w", err)}
 				}
 				if id, err = uploader.ParseUpload(ctx, body); err != nil {
-					return err
+					return providerExecutionPhaseError{Phase: "upload", Err: err}
 				}
 				uploaded[key] = id
 			}
@@ -83,7 +83,7 @@ func uploadProtocolMedia(ctx context.Context, input canvasGenerationInput, adapt
 }
 
 // executeIdempotentProtocolCreate 只在清单声明 idempotentCreate 时重试 create：上游以宿主幂等键
-// 作为任务 ID 去重，重复提交不会产生第二个计费任务。4xx（除 429）是参数问题，重试无意义。
+// 作为任务 ID 去重，重复提交不会产生第二个计费任务。明确的用户输入错误不重试。
 func executeIdempotentProtocolCreate(ctx context.Context, input canvasGenerationInput, spec protocol.RequestSpec, idempotent bool) ([]byte, *protocol.Result, error) {
 	attempts := 1
 	if idempotent {
@@ -106,7 +106,18 @@ func executeIdempotentProtocolCreate(ctx context.Context, input canvasGeneration
 func retryableIdempotentCreate(err error) bool {
 	var httpErr providerHTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= http.StatusInternalServerError
+		if httpErr.StatusCode == http.StatusBadRequest || httpErr.StatusCode == http.StatusUnprocessableEntity || httpErr.StatusCode == 524 {
+			// 524: provider gateway timeout; the request may still be executing.
+			return false
+		}
+		body := strings.ToLower(httpErr.Body)
+		if providerErrorLooksExplicitPlatformFailure(body) {
+			return true
+		}
+		if providerErrorLooksUserCaused(body) {
+			return false
+		}
+		return providerHTTPStatusAllowsPlatformRetry(httpErr.StatusCode)
 	}
 	return isTransientTransportError(err)
 }

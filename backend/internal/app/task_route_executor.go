@@ -50,7 +50,14 @@ func (e *taskRouteExecutor) execute(ctx context.Context, task *model.Task, attem
 		}
 		execution.result, execution.canvasOps, execution.err = e.port.processTask(withProviderSubmissionKey(ctx, attempt), *task)
 		if stateErr := e.port.refreshTaskProviderState(task); stateErr != nil {
-			return taskRouteExecutionResult{}, stateErr
+			// The provider call has already completed, but we cannot safely read
+			// the persisted request state. Surface it through the terminal path so
+			// billing stays in reconciliation instead of failing over or retrying
+			// as if the provider had definitely rejected the request.
+			providerSucceeded := execution.err == nil
+			execution.err = errors.Join(execution.err, stateErr)
+			execution.providerSucceeded = providerSucceeded
+			return execution, nil
 		}
 		var deliveryFailure *mediaRecoveryError
 		if errors.As(execution.err, &deliveryFailure) {

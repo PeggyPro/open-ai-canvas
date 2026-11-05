@@ -4,13 +4,13 @@ import type { GenerationTask } from "@/services/api/task-center";
 type TaskBilling = NonNullable<GenerationTask["billing"]>;
 
 export type TaskBillingDisplay = {
-    /** 主金额：已结算为实收，已退回为退回额，其余为冻结额。 */
+    /** 主金额：已结算为实收，已退回为退回额，已释放与其他未结算状态为冻结额。 */
     amount: string;
-    /** 状态：已结算、冻结、已退回、待核对。 */
+    /** 状态：已结算、冻结、已退回、已释放、待核对。 */
     note: string;
     /** 已结算且有差额退回时为“退回 X”，其余为空串。 */
     refundNote: string;
-    tone: "settled" | "held" | "refunded" | "uncertain";
+    tone: "settled" | "held" | "refunded" | "released" | "uncertain";
 };
 
 /** 任务计费的展示口径：冻结额不是扣费，只有已结算才显示实收。任务中心与画布任务列表共用。 */
@@ -25,6 +25,8 @@ export function taskBillingDisplay(billing: TaskBilling): TaskBillingDisplay {
             };
         case "refunded":
             return { amount: formatCredits(billing.refundedMicrocredits || billing.reservedMicrocredits), note: "已退回", refundNote: "", tone: "refunded" };
+        case "released":
+            return { amount: formatCredits(billing.reservedMicrocredits), note: "预授权已释放", refundNote: "", tone: "released" };
         case "uncertain":
             return { amount: formatCredits(billing.reservedMicrocredits), note: "待核对", refundNote: "", tone: "uncertain" };
         default:

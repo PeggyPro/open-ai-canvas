@@ -42,7 +42,8 @@ func (s *Service) EnrichAPICallLog(log *model.ApiCallLog, responseBody []byte) {
 	if log == nil {
 		return
 	}
-	if log.ProviderRequestID == "" {
+	canHydrateProviderID := providerRequestKindCanHydrateProviderID(log.RequestKind, log.Path)
+	if canHydrateProviderID && log.ProviderRequestID == "" {
 		log.ProviderRequestID = providerRequestIDFromPath(log.Path)
 	}
 	payloads := providerResponsePayloads(responseBody)
@@ -50,6 +51,24 @@ func (s *Service) EnrichAPICallLog(log *model.ApiCallLog, responseBody []byte) {
 		s.enrichAPICallLogPayload(log, payload)
 	}
 	s.enrichAPICallLogFailureSummary(log, responseBody)
+}
+
+func providerRequestKindCanHydrateProviderID(requestKind string, path string) bool {
+	switch strings.ToLower(strings.TrimSpace(requestKind)) {
+	case "upload":
+		return false
+	case "create", "poll":
+		return true
+	}
+	// Older logs predate request_kind. Keep their generation IDs while
+	// excluding common legacy upload endpoints by path.
+	path = strings.ToLower(strings.TrimSpace(path))
+	for _, marker := range []string{"upload", "/files", "/uploads"} {
+		if strings.Contains(path, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) enrichAPICallLogFailureSummary(log *model.ApiCallLog, responseBody []byte) {
@@ -141,10 +160,12 @@ func (s *Service) enrichAPICallLogPayload(log *model.ApiCallLog, payload map[str
 		}
 		log.CachedTokens = firstInt64(usageMetadata, "cachedContentTokenCount")
 	}
-	if extracted, err := firstJSONString(payload, "task_id", "id", "request_id", "name"); err == nil {
-		log.ProviderRequestID = firstNonEmpty(nestedTaskID, extracted, log.ProviderRequestID)
-	} else {
-		log.ProviderRequestID = firstNonEmpty(nestedTaskID, log.ProviderRequestID)
+	if providerRequestKindCanHydrateProviderID(log.RequestKind, log.Path) {
+		if extracted, err := firstJSONString(payload, "task_id", "id", "request_id", "name"); err == nil {
+			log.ProviderRequestID = firstNonEmpty(nestedTaskID, extracted, log.ProviderRequestID)
+		} else {
+			log.ProviderRequestID = firstNonEmpty(nestedTaskID, log.ProviderRequestID)
+		}
 	}
 	log.ProviderStatus = strings.ToLower(firstNonEmpty(stringField(payload, "status"), log.ProviderStatus))
 	if log.ProviderStatus == "failed" || log.ProviderStatus == "cancelled" || log.ProviderStatus == "expired" {

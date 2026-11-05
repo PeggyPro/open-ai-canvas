@@ -136,7 +136,7 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 	policy, err := reader.RuntimePolicy()
 	cancelPolicy()
 	if err != nil {
-		return err
+		return terminal.markPreparationFailure(task, "运行策略读取失败", err, false, "运行策略读取失败，上游请求未发出", true)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), taskExecutionTimeout(task, policy.Task))
 	defer cancel()
@@ -198,11 +198,11 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 	// Re-read the feature policy before preparing or dispatching a model route.
 	decryptedInput, err := s.decryptTaskInputJSON(task.InputJSON)
 	if err != nil {
-		return err
+		return terminal.markPreparationFailure(task, "任务输入解密失败", err, false, "任务输入解密失败，上游请求未发出", true)
 	}
 	var admissionInput map[string]any
 	if err := json.Unmarshal([]byte(decryptedInput), &admissionInput); err != nil {
-		return err
+		return terminal.markPreparationFailure(task, "任务输入解析失败", err, false, "任务输入解析失败，上游请求未发出", true)
 	}
 	if err := s.requireCustomChannelsForTaskInput(admissionInput); err != nil {
 		// A reclaimed task may already have submitted upstream. Keep the existing
@@ -219,15 +219,30 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 		if len(attempts) == 0 && task.RouteRun <= 1 && task.Attempts > 1 {
 			uncertain = true
 		}
-		return terminal.markPreparationFailure(task, "渠道不可用", errors.Join(err, readErr), uncertain, "自定义渠道已关闭，上游请求未发出")
+		return terminal.markPreparationFailure(task, "渠道不可用", errors.Join(err, readErr), uncertain, "自定义渠道已关闭，上游请求未发出", false)
 	}
 
 	s.markAgentMemoryCompactRunning(*task)
 	// 回查已提交的上游任务：领取时保留了上一轮的上游阶段与进度，这里不重置为“作品创作中”。
+	// 保持“后端接管任务/正在准备创作”直到路由和计费准备完成，使取消请求在
+	// billable create 出站边界前仍能安全释放音频预授权。
 	resumedStage, resumedProgress := "", task.Progress
 	if task.ProviderRequestID != "" {
 		resumedStage = strings.TrimSpace(task.Stage)
 	}
+	routeAttempt, err := s.beginTaskRouteAttempt(task)
+	if err != nil {
+		return terminal.markPreparationFailure(task, "路由准备失败", err, isRouteDispatchUncertain(err), "路由准备失败，上游请求未发出", false)
+	}
+	if err := s.taskBilling().MarkBillingRunning(task.BillingOrderID); err != nil {
+		if latest, latestErr := s.repo.Task(task.ID); latestErr == nil && latest.Status == model.TaskStatusCancelled {
+			return terminal.handleAlreadyCancelled(*latest)
+		}
+		// 无法确认订单是否已进入 running 时，不能释放或退款，避免把已消费的音频额度退回。
+		return terminal.markPreparationFailure(task, "计费准备失败", err, true, "", false)
+	}
+	// 只有路由和预授权都准备完成后才公开“调用生成模型”。此前保持可取消
+	// 的准备阶段；这个带租约的条件写入也会在并发取消先落库时失败，阻止继续出站。
 	task.Stage = "调用生成模型"
 	task.Progress = 35
 	if taskUsesUpstreamReportedProgress(task.Type) {
@@ -240,18 +255,25 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 		task.Stage, task.Progress = resumedStage, resumedProgress
 	}
 	if err := s.repo.UpdateTaskProgressForLease(task.ID, task.LeaseOwner, task.Stage, task.Progress); err != nil {
-		return fmt.Errorf("更新任务进度失败，任务暂未调用上游：%w", err)
+		if latest, latestErr := s.repo.Task(task.ID); latestErr == nil && latest.Status == model.TaskStatusCancelled {
+			return terminal.handleAlreadyCancelled(*latest)
+		}
+		return terminal.markPreparationFailure(task, "任务进度更新失败", fmt.Errorf("更新任务进度失败，任务暂未调用上游：%w", err), false, "任务进度更新失败，上游请求未发出", true)
 	}
-	routeAttempt, err := s.beginTaskRouteAttempt(task)
-	if err != nil {
-		return terminal.markPreparationFailure(task, "路由准备失败", err, isRouteDispatchUncertain(err), "路由准备失败，上游请求未发出")
-	}
-	if err := s.taskBilling().MarkBillingRunning(task.BillingOrderID); err != nil {
-		return terminal.markPreparationFailure(task, "计费准备失败", err, false, "计费准备失败，上游请求未发出")
-	}
+	// 音频结算由 Provider 出站边界负责：只有拿到渠道并发槽位、通过本地请求校验，
+	// 并且即将调用 client.Do 时才扣除报价；上传、轮询和下载不会重复结算。
 	routeResult, stateErr := s.routeExecutor().execute(ctx, task, routeAttempt)
 	if stateErr != nil {
-		return stateErr
+		// Preserve the provider error and its submission evidence when route-state
+		// persistence also fails. A state error alone does not prove that execution
+		// started; the route executor records that separately on the result.
+		executionErr := routeResult.err
+		if executionErr == nil {
+			executionErr = stateErr
+		} else if !errors.Is(executionErr, stateErr) {
+			executionErr = errors.Join(executionErr, stateErr)
+		}
+		return terminal.handleExecutionFailure(task, executionErr, routeResult.providerSucceeded, providerRequestDefinitelyNotSubmitted(executionErr))
 	}
 	select {
 	case leaseErr := <-leaseLost:
@@ -261,7 +283,12 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 	result, canvasOps, err := routeResult.result, routeResult.canvasOps, routeResult.err
 	latestMedia, readErr := s.repo.Task(task.ID)
 	if readErr != nil {
-		return readErr
+		stateReadErr := fmt.Errorf("刷新任务状态失败，任务结果暂未安全落盘：%w", readErr)
+		if routeResult.err != nil {
+			return terminal.handleExecutionFailure(task, errors.Join(routeResult.err, stateReadErr), true, false)
+		}
+		_, terminalErr := terminal.handleResultPersistenceFailure(task, stateReadErr)
+		return terminalErr
 	}
 	task.MediaRecoveryJSON, task.MediaStage = latestMedia.MediaRecoveryJSON, latestMedia.MediaStage
 	task.ProviderRequestID, task.PollStage = latestMedia.ProviderRequestID, latestMedia.PollStage
@@ -277,7 +304,7 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 		_, err = s.finalizeCharacterTurnaroundTask(*task, result)
 	}
 	if err != nil {
-		channelSlotFailedBeforeRequest := false
+		channelSlotFailedBeforeRequest := providerRequestDefinitelyNotSubmitted(err)
 		if code, _ := ChannelSlotFailureDetails(err); code != "" {
 			channelSlotFailedBeforeRequest = true
 		}
@@ -340,7 +367,9 @@ func (w *taskWorkerCoordinator) processClaimedTask(task *model.Task, globalSlot 
 	}
 	latest, err := s.repo.Task(task.ID)
 	if err != nil {
-		return err
+		stateReadErr := fmt.Errorf("任务成功后刷新任务状态失败，结果暂未安全落盘：%w", err)
+		_, terminalErr := terminal.handleResultPersistenceFailure(task, stateReadErr)
+		return terminalErr
 	}
 	if latest.Status == model.TaskStatusCancelled {
 		s.noteAgentMemoryCompactTask(*task, nil, errors.New("压缩任务已取消"))

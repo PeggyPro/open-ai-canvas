@@ -106,6 +106,7 @@ const (
 	BillingStatusRunning   BillingStatus = "running"
 	BillingStatusSettled   BillingStatus = "settled"
 	BillingStatusRefunded  BillingStatus = "refunded"
+	BillingStatusReleased  BillingStatus = "released"
 	BillingStatusUncertain BillingStatus = "uncertain"
 
 	ProviderCancelStatusRequested ProviderCancelStatus = "requested"
@@ -117,6 +118,7 @@ const (
 	CreditLedgerReserve      CreditLedgerType = "reserve"
 	CreditLedgerConsume      CreditLedgerType = "consume"
 	CreditLedgerRefund       CreditLedgerType = "refund"
+	CreditLedgerRelease      CreditLedgerType = "release"
 	CreditLedgerAdminAdjust  CreditLedgerType = "admin_adjustment"
 	CreditLedgerSignupBonus  CreditLedgerType = "signup_bonus"
 	CreditLedgerCheckinBonus CreditLedgerType = "checkin_bonus"

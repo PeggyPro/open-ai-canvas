@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -44,6 +46,17 @@ func (r *taskTerminalRepositoryStub) UpdateTaskTerminalDiagnostic(task *model.Ta
 	return true, nil
 }
 
+func (r *taskTerminalRepositoryStub) UpdateTaskExecutionDiagnostic(_ string, _ string, diagnosticJSON string) error {
+	if r.task != nil {
+		r.task.ExecutionDiagnosticJSON = diagnosticJSON
+		var diagnostic model.TaskExecutionDiagnostic
+		if err := json.Unmarshal([]byte(diagnosticJSON), &diagnostic); err == nil {
+			r.task.Diagnostic = &diagnostic
+		}
+	}
+	return nil
+}
+
 func TestTaskTerminalConflictDoesNotRefundOrFinalize(t *testing.T) {
 	repo := &taskTerminalRepositoryStub{terminalConflict: true}
 	billing, replay := &taskTerminalBillingStub{}, &taskTerminalReplayStub{}
@@ -61,17 +74,24 @@ func TestTaskTerminalConflictDoesNotRefundOrFinalize(t *testing.T) {
 
 type taskTerminalBillingStub struct {
 	uncertain      []string
+	release        []string
 	refund         []string
 	settleCalls    int
 	review         bool
 	settleError    error
 	uncertainError error
+	releaseError   error
 	refundError    error
 }
 
 func (b *taskTerminalBillingStub) MarkBillingUncertain(_ string, reason string) error {
 	b.uncertain = append(b.uncertain, reason)
 	return b.uncertainError
+}
+
+func (b *taskTerminalBillingStub) ReleaseBillingReservation(_ string, reason string) error {
+	b.release = append(b.release, reason)
+	return b.releaseError
 }
 
 func (b *taskTerminalBillingStub) RefundBilling(_ string, reason string) error {
@@ -274,5 +294,187 @@ func TestTaskTerminalCoordinatorReturnsTaskReadErrorAfterSuccess(t *testing.T) {
 	}
 	if billing.settleCalls != 1 {
 		t.Fatalf("billing settlement calls = %d, want 1", billing.settleCalls)
+	}
+}
+
+func TestTaskTerminalCoordinatorConsumesAudioOnPlatformFailureAndMarksFreeRetry(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	billing := &taskTerminalBillingStub{}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		&taskTerminalRepositoryStub{task: task}, billing, &taskTerminalReplayStub{},
+		&taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := providerHTTPError{StatusCode: 503, Status: "503 Service Unavailable"}
+
+	if err := coordinator.handleExecutionFailure(task, failure, false, false); !errors.Is(err, failure) {
+		t.Fatalf("handleExecutionFailure() error = %v, want %v", err, failure)
+	}
+	if billing.settleCalls != 1 || len(billing.refund) != 0 {
+		t.Fatalf("audio billing actions: settle=%d refund=%v", billing.settleCalls, billing.refund)
+	}
+	if task.Diagnostic == nil || task.Diagnostic.RetryClass != "platform_retry" {
+		t.Fatalf("diagnostic = %#v, want platform_retry", task.Diagnostic)
+	}
+}
+
+func TestTaskTerminalCoordinatorDoesNotGrantFreeRetryForAudioUserError(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	billing := &taskTerminalBillingStub{}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		&taskTerminalRepositoryStub{task: task}, billing, &taskTerminalReplayStub{},
+		&taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := providerHTTPError{StatusCode: 422, Status: "422 Unprocessable Entity"}
+
+	if err := coordinator.handleExecutionFailure(task, failure, false, false); !errors.Is(err, failure) {
+		t.Fatalf("handleExecutionFailure() error = %v, want %v", err, failure)
+	}
+	if billing.settleCalls != 1 || len(billing.refund) != 0 {
+		t.Fatalf("audio billing actions: settle=%d refund=%v", billing.settleCalls, billing.refund)
+	}
+	if task.Diagnostic == nil || task.Diagnostic.RetryClass == "platform_retry" {
+		t.Fatalf("diagnostic = %#v, must not grant platform_retry", task.Diagnostic)
+	}
+}
+
+func TestAudioPreRequestFailureReleasesReservationAndAllowsPlatformRetry(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	billing := &taskTerminalBillingStub{}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		&taskTerminalRepositoryStub{task: task}, billing, &taskTerminalReplayStub{},
+		&taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := providerRequestNotStartedError{Err: errors.New("provider connection refused")}
+
+	if err := coordinator.handleExecutionFailure(task, failure, false, false); !errors.Is(err, failure) {
+		t.Fatalf("handleExecutionFailure() error = %v, want %v", err, failure)
+	}
+	if len(billing.release) != 1 || billing.settleCalls != 0 || len(billing.refund) != 0 {
+		t.Fatalf("audio pre-request billing actions: release=%v settle=%d refund=%v", billing.release, billing.settleCalls, billing.refund)
+	}
+	if task.Diagnostic == nil || task.Diagnostic.RetryClass != "platform_retry" {
+		t.Fatalf("diagnostic = %#v, want platform_retry", task.Diagnostic)
+	}
+}
+
+func TestAudioBillingReleaseFailureBlocksRetryWithReconciliationDiagnostic(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	repo := &taskTerminalRepositoryStub{task: task}
+	billing := &taskTerminalBillingStub{releaseError: errors.New("billing database unavailable")}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		repo, billing, &taskTerminalReplayStub{}, &taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := providerRequestNotStartedError{Err: errors.New("provider connection refused")}
+
+	if err := coordinator.handleExecutionFailure(task, failure, false, false); err == nil {
+		t.Fatal("handleExecutionFailure() error = nil, want billing cleanup failure")
+	}
+	if len(billing.release) != 1 || len(billing.uncertain) != 1 {
+		t.Fatalf("billing cleanup actions: release=%v uncertain=%v", billing.release, billing.uncertain)
+	}
+	if diagnostic := taskExecutionDiagnostic(repo.task); diagnostic == nil || diagnostic.RetryClass != "reconcile_submission" {
+		t.Fatalf("persisted diagnostic = %#v, want reconcile_submission", diagnostic)
+	}
+}
+
+func TestAudioPreRequestUserErrorReleasesReservationWithoutFreeRetry(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	billing := &taskTerminalBillingStub{}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		&taskTerminalRepositoryStub{task: task}, billing, &taskTerminalReplayStub{},
+		&taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := providerRequestNotStartedError{Err: errors.New("invalid parameter")}
+
+	if err := coordinator.handleExecutionFailure(task, failure, false, false); !errors.Is(err, failure) {
+		t.Fatalf("handleExecutionFailure() error = %v, want %v", err, failure)
+	}
+	if len(billing.release) != 1 || billing.settleCalls != 0 || len(billing.refund) != 0 {
+		t.Fatalf("audio pre-request user-error billing actions: release=%v settle=%d refund=%v", billing.release, billing.settleCalls, billing.refund)
+	}
+	if task.Diagnostic == nil || task.Diagnostic.RetryClass == "platform_retry" {
+		t.Fatalf("diagnostic = %#v, must not grant platform_retry", task.Diagnostic)
+	}
+}
+
+func TestPreparationPlatformFailureAllowsAudioFreeRetry(t *testing.T) {
+	task := &model.Task{
+		ID: "audio-task", UserID: "user-1", Type: "canvas_audio", WorkbenchKind: model.WorkbenchKindAudio,
+		BillingOrderID: "order-1",
+	}
+	repo := &taskTerminalRepositoryStub{task: task}
+	billing := &taskTerminalBillingStub{}
+	coordinator := newTaskTerminalCoordinatorForTest(
+		repo, billing, &taskTerminalReplayStub{}, &taskTerminalLoggerStub{}, &taskTerminalOutputStub{},
+	)
+	failure := errors.New("runtime policy store unavailable")
+
+	if err := coordinator.markPreparationFailure(task, "运行策略读取失败", failure, false, "运行策略读取失败，上游请求未发出", true); !errors.Is(err, failure) {
+		t.Fatalf("markPreparationFailure() error = %v, want %v", err, failure)
+	}
+	if len(billing.release) != 1 || billing.settleCalls != 0 || len(billing.refund) != 0 {
+		t.Fatalf("preparation platform billing actions: release=%v settle=%d refund=%v", billing.release, billing.settleCalls, billing.refund)
+	}
+	if task.Diagnostic == nil || task.Diagnostic.RetryClass != "platform_retry" {
+		t.Fatalf("diagnostic = %#v, want platform_retry", task.Diagnostic)
+	}
+}
+
+func TestAudioPlatformRetryClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "unauthorized", err: providerHTTPError{StatusCode: 401}, want: false},
+		{name: "forbidden", err: providerHTTPError{StatusCode: 403}, want: false},
+		{name: "not found", err: providerHTTPError{StatusCode: 404}, want: false},
+		{name: "provider rate limited", err: providerHTTPError{StatusCode: 429}, want: true},
+		{name: "request timeout remains billing-uncertain", err: providerHTTPError{StatusCode: 408}, want: false},
+		{name: "user quota rate limited", err: providerHTTPError{StatusCode: 429, Body: "quota exceeded"}, want: false},
+		{name: "server error", err: providerHTTPError{StatusCode: 503}, want: true},
+		{name: "site overloaded", err: providerHTTPError{StatusCode: 529}, want: true},
+		{name: "bad request", err: providerHTTPError{StatusCode: 400}, want: false},
+		{name: "unprocessable", err: providerHTTPError{StatusCode: 422}, want: false},
+		{name: "gateway timeout", err: providerHTTPError{StatusCode: 524}, want: false},
+		{name: "moderation payload", err: providerHTTPError{StatusCode: 503, Body: `{"code":"sensitive_words_detected"}`}, want: false},
+		{name: "invalid parameter payload", err: providerHTTPError{StatusCode: 503, Body: `{"code":"invalid_parameter"}`}, want: false},
+		{name: "authentication service outage", err: providerHTTPError{StatusCode: 503, Body: "authentication service unavailable"}, want: true},
+		{name: "quota service outage", err: providerHTTPError{StatusCode: 502, Body: "quota service unavailable"}, want: true},
+		{name: "structured authentication service outage", err: providerPayloadError{raw: "authentication service unavailable", message: "渠道认证服务暂不可用"}, want: true},
+		{name: "structured quota service outage", err: providerPayloadError{raw: "quota service unavailable", message: "渠道额度服务暂不可用"}, want: true},
+		{name: "structured user quota error", err: providerPayloadError{raw: "quota exceeded", message: "渠道余额不足"}, want: false},
+		{name: "structured invalid parameter error", err: providerPayloadError{raw: "invalid parameter", message: "参数无效"}, want: false},
+		{name: "invalid input message", err: errors.New("provider rejected invalid input"), want: false},
+		{name: "invalid input chinese message", err: errors.New("输入无效"), want: false},
+		{name: "invalid upstream response", err: errors.New("invalid upstream response"), want: true},
+		{name: "load balancer outage", err: errors.New("load balancer unavailable"), want: true},
+		{name: "upload response missing id", err: providerExecutionPhaseError{Phase: "upload", Err: errors.New("上游素材上传没有返回素材 ID")}, want: true},
+		{name: "ambiguous timeout", err: errors.New("upstream timeout; request may have been accepted"), want: false},
+		{name: "protocol outage", err: errors.New("provider connection refused"), want: true},
+		{name: "wrapped circuit outage", err: fmt.Errorf("route failed: %w", providerCircuitOpenError{}), want: true},
+		{name: "undecodable provider response", err: providerResponseDecodeError{Err: errors.New("invalid character '<' looking for beginning of value")}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := audioPlatformRetryAllowed(test.err); got != test.want {
+				t.Fatalf("audioPlatformRetryAllowed(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
 	}
 }
