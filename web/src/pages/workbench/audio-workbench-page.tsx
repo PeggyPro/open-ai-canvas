@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { App, Button, Form, Input, InputNumber, Popconfirm, Select, Spin, Tag } from "antd";
-import { AudioLines, Download, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { App, Button, Form, Input, InputNumber, Popconfirm, Select, Spin } from "antd";
+import { AudioLines, Copy, Download, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { ModelPicker } from "@/components/model-picker";
 import { PageHeader, PaginationBar, WorkspacePage } from "@/components/layout/workspace-page";
 import { Callout } from "@/components/ui/product/callout/callout";
@@ -12,11 +12,91 @@ import { downloadBrowserMedia } from "@/services/browser-download";
 import { modelOptionName, selectableModelsByCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { audioWorkbenchGenerationDurationMs, audioWorkbenchOutput, audioWorkbenchRequest, audioWorkbenchSnapshot, formatAudioWorkbenchGenerationDuration, isSpeechWorkbenchModel } from "./audio-workbench";
-import { isActiveWorkbenchTask, workbenchTaskStateLabel } from "./workbench-batches";
+import { isActiveWorkbenchTask } from "./workbench-batches";
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : "操作失败，请稍后重试");
 const queryRoot = (userId: string) => ["audio-workbench", userId] as const;
 const HISTORY_PAGE_SIZE = 10;
+
+async function copyTextToClipboard(value: string) {
+    try {
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(value);
+            return;
+        }
+    } catch {
+        // Fall through to the legacy browser copy path.
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    if (!copied) throw new Error("copy failed");
+}
+
+type AudioTaskStatusMeta = {
+    label: string;
+    borderColor: string;
+    iconClassName: string;
+    badgeClassName: string;
+    progressClassName: string;
+    textClassName: string;
+};
+
+function audioTaskStatusMeta(status: GenerationTask["status"]): AudioTaskStatusMeta {
+    switch (status) {
+        case "succeeded":
+            return {
+                label: "已完成",
+                borderColor: "#27a36a",
+                iconClassName: "bg-emerald-50 text-emerald-600",
+                badgeClassName: "border-emerald-200 bg-emerald-50 text-emerald-700",
+                progressClassName: "bg-emerald-500",
+                textClassName: "text-emerald-700",
+            };
+        case "failed":
+            return {
+                label: "失败",
+                borderColor: "#df4f5f",
+                iconClassName: "bg-red-50 text-red-600",
+                badgeClassName: "border-red-200 bg-red-50 text-red-700",
+                progressClassName: "bg-red-500",
+                textClassName: "text-red-700",
+            };
+        case "running":
+            return {
+                label: "进行中",
+                borderColor: "#4387e8",
+                iconClassName: "bg-blue-50 text-blue-600",
+                badgeClassName: "border-blue-200 bg-blue-50 text-blue-700",
+                progressClassName: "bg-blue-500",
+                textClassName: "text-blue-700",
+            };
+        case "queued":
+            return {
+                label: "排队中",
+                borderColor: "#d89c24",
+                iconClassName: "bg-amber-50 text-amber-600",
+                badgeClassName: "border-amber-200 bg-amber-50 text-amber-700",
+                progressClassName: "bg-amber-500",
+                textClassName: "text-amber-700",
+            };
+        default:
+            return {
+                label: "已取消",
+                borderColor: "#94a3b8",
+                iconClassName: "bg-slate-50 text-slate-500",
+                badgeClassName: "border-slate-200 bg-slate-50 text-slate-600",
+                progressClassName: "bg-slate-400",
+                textClassName: "text-slate-600",
+            };
+    }
+}
 
 function AudioPlayback({ url }: { url: string }) {
     const [failed, setFailed] = useState(false);
@@ -43,6 +123,8 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
     const output = audioWorkbenchOutput(task);
     const snapshot = audioWorkbenchSnapshot(task);
     const active = isActiveWorkbenchTask(task);
+    const statusMeta = audioTaskStatusMeta(task.status);
+    const progress = Math.min(100, Math.max(8, typeof task.progress === "number" ? (task.progress <= 1 ? task.progress * 100 : task.progress) : task.status === "queued" ? 12 : 61));
     const [, setElapsedTick] = useState(0);
     useEffect(() => {
         if (!active) return;
@@ -73,18 +155,41 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
         }
     };
     return (
-        <article className="space-y-3 rounded-xl border border-border bg-surface p-4">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                    <AudioLines className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                    <span className="truncate text-sm font-medium">{task.model || "语音合成"}</span>
-                    <Tag color={task.status === "succeeded" ? "success" : task.status === "failed" ? "error" : active ? "processing" : "default"}>{task.status === "failed" ? "生成失败" : workbenchTaskStateLabel(task)}</Tag>
+        <article className="relative space-y-3 overflow-hidden rounded-xl border border-border border-l-4 bg-surface p-4 shadow-sm" style={{ borderLeftColor: statusMeta.borderColor }}>
+            <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                    <div className="flex min-w-0 items-center gap-2">
+                        <span className={`grid size-7 shrink-0 place-items-center rounded-lg ${statusMeta.iconClassName}`}>
+                            <AudioLines className="size-4" aria-hidden />
+                        </span>
+                        <span className="truncate text-sm font-medium">{task.model || "语音合成"}</span>
+                    </div>
+                    <span className={`mt-2 inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-semibold ${statusMeta.badgeClassName}`}>
+                        <span className={`size-1.5 rounded-full bg-current ${active ? "animate-pulse" : ""}`} aria-hidden />
+                        {statusMeta.label}
+                    </span>
                 </div>
                 <time className="text-xs text-muted-foreground" dateTime={task.createdAt}>
                     {new Date(task.createdAt).toLocaleString()}
                 </time>
             </div>
-            <p className="max-h-36 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed">{task.prompt}</p>
+            <div className="relative">
+                <p className="max-h-36 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-border/70 bg-muted/20 p-3 pr-12 text-sm leading-relaxed">{task.prompt}</p>
+                <Button
+                    type="default"
+                    size="small"
+                    icon={<Copy className="size-3.5" />}
+                    aria-label="复制文本"
+                    title="复制文本"
+                    className="!absolute right-2 top-2 z-10 !h-8 !w-8 !p-0"
+                    disabled={!task.prompt.trim()}
+                    onClick={() =>
+                        void copyTextToClipboard(task.prompt)
+                            .then(() => message.success("文本已复制"))
+                            .catch(() => message.error("复制失败，请手动选择文本复制"))
+                    }
+                />
+            </div>
             {detail.data && (
                 <p className="text-xs text-muted-foreground">
                     音色：{snapshot.voice} · {snapshot.format.toUpperCase()} · 语速 {snapshot.speed}×
@@ -93,13 +198,23 @@ function AudioTaskCard({ summary, userId, onReuse }: { summary: GenerationTask; 
             {generationDuration && (
                 <p className="text-xs text-muted-foreground" title="从任务开始执行到完成的墙钟时间，不包含排队等待，也不是生成音频本身的播放时长">
                     生成耗时：{generationDuration}
-                    {active ? "（进行中）" : "（不含排队）"}
+                    {task.status === "queued" ? "（排队中）" : active ? "（进行中）" : "（不含排队）"}
                 </p>
             )}
             {active && (
-                <p className="text-sm text-muted-foreground" role="status">
-                    <Spin size="small" /> {task.stage || "任务正在处理中，可以离开页面，稍后回来查看结果。"}
-                </p>
+                <div className="space-y-2" role="status">
+                    <div className={`flex items-center justify-between text-xs font-semibold ${statusMeta.textClassName}`}>
+                        <span className="inline-flex items-center gap-1.5">
+                            <Spin size="small" />
+                            {task.status === "queued" ? "等待资源" : "调用生成模型"}
+                        </span>
+                        <span>{task.status === "queued" ? "排队等待" : "处理中"}</span>
+                    </div>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                        <div className={`h-full rounded-full transition-all ${statusMeta.progressClassName}`} style={{ width: `${progress}%` }} />
+                    </div>
+                    <p className="text-xs text-muted-foreground">{task.stage || (task.status === "queued" ? "前面的任务完成后将自动开始生成。" : "任务正在处理中，可以离开页面，稍后回来查看结果。")}</p>
+                </div>
             )}
             {task.error && (
                 <Callout tone="error" title="生成未完成">
